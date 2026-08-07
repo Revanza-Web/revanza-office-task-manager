@@ -1,0 +1,12 @@
+{
+  "name": "Revanza Office Task Manager",
+  "short_name": "Revanza",
+  "description": "Attendance, tasks, legal cases and follow-ups for Revanza",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#171A20",
+  "theme_color": "#171A20",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
