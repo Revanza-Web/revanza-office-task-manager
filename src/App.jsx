@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { LIVE, sbSession, sbSignIn, sbSignUp, sbChangePin, sbSignOut, fetchAll, syncDB } from "./lib/db.js";
 
 /* ============================================================
    REVANZA OFFICE TASK MANAGER — working prototype console
@@ -478,37 +479,74 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
+      if (LIVE) {
+        const s = await sbSession();
+        if (s) {
+          const d = await fetchAll();
+          setDb(d);
+          const u = d.users.find((x) => x.authId === s.user.id);
+          if (u && u.status === "Active") setMe(u.id);
+        }
+        return;
+      }
       let d = await loadDB();
       if (!d) { d = seedDB(); await saveDB(d); }
       setDb(d);
       try {
-        const s = localStorage.getItem(SESSION_KEY);
-        const u = s && d.users.find((x) => x.id === JSON.parse(s));
+        const sv = localStorage.getItem(SESSION_KEY);
+        const u = sv && d.users.find((x) => x.id === JSON.parse(sv));
         if (u && u.status === "Active") setMe(u.id);
       } catch { /* no session */ }
     })();
   }, []);
+
+  // live mode: pull everyone else's changes every 45 s and on window focus
+  useEffect(() => {
+    if (!LIVE || !me) return;
+    const refresh = async () => { try { setDb(await fetchAll()); } catch { /* offline */ } };
+    const iv = setInterval(refresh, 45000);
+    window.addEventListener("focus", refresh);
+    return () => { clearInterval(iv); window.removeEventListener("focus", refresh); };
+  }, [me]);
 
   const commit = useCallback((mut, note) => {
     setDb((prev) => {
       const next = JSON.parse(JSON.stringify(prev));
       mut(next);
       if (note) next.audit.unshift({ ts: Date.now(), by: note.by || "system", action: note.action, detail: note.detail || "" });
-      saveDB(next);
+      if (LIVE) {
+        const meUser = me && prev.users.find((u) => u.id === me);
+        syncDB(prev, next, meUser ? meUser.role : "");
+      } else saveDB(next);
       return next;
     });
-  }, []);
+  }, [me]);
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 2600); };
 
   const user = db && me ? db.users.find((u) => u.id === me) : null;
   const alerts = useMemo(() => (db ? buildAlerts(db) : []), [db]);
 
   const signOut = async () => {
-    try { localStorage.removeItem(SESSION_KEY); } catch { }
+    if (LIVE) { try { await sbSignOut(); } catch { } }
+    else { try { localStorage.removeItem(SESSION_KEY); } catch { } }
     setMe(null); setView("dashboard");
   };
   const go = (v, p = null, f = null) => { setView(v); setPreset(p); setFocus(f); setNavOpen(false); };
 
+  if (LIVE && !me) return (
+    <>
+      <Styles />
+      <LiveLogin onIn={async () => {
+        const d = await fetchAll();
+        setDb(d);
+        const s = await sbSession();
+        const u = s && d.users.find((x) => x.authId === s.user.id);
+        if (u && u.status === "Active") setMe(u.id);
+        else setToast("Signed in, but no active profile is linked to this number. Ask the Owner.");
+      }} />
+      {toast && <div className="toast">{toast}</div>}
+    </>
+  );
   if (!db) return (<><Styles /><div className="boot"><Mark size={40} /><p>Loading workspace…</p></div></>);
   if (!user) return (<><Styles /><Login db={db} commit={commit} onIn={(id) => { setMe(id); try { localStorage.setItem(SESSION_KEY, JSON.stringify(id)); } catch { } }} /></>);
   if (user.mustChangePin) return (<><Styles /><ChangePin user={user} commit={commit} first onDone={() => flash("PIN changed")} /></>);
@@ -576,6 +614,71 @@ export default function App() {
 }
 
 /* ============================ LOGIN ============================ */
+function LiveLogin({ onIn }) {
+  const [tab, setTab] = useState("in");
+  const [mobile, setMobile] = useState("");
+  const [pin, setPin] = useState("");
+  const [pin2, setPin2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const submit = async (e) => {
+    e.preventDefault(); setErr("");
+    const m = mobile.trim();
+    if (!/^\d{10}$/.test(m)) return setErr("Enter the 10-digit registered mobile number.");
+    if (!/^\d{4}$/.test(pin)) return setErr("The PIN must be exactly 4 digits.");
+    setBusy(true);
+    if (tab === "in") {
+      const { error } = await sbSignIn(m, pin);
+      setBusy(false);
+      if (error) return setErr("Sign-in failed. Check the number and PIN — or, if you have never created a PIN, use 'First time here'.");
+      await onIn();
+    } else {
+      if (pin !== pin2) { setBusy(false); return setErr("The two PINs do not match."); }
+      const { error } = await sbSignUp(m, pin);
+      if (error) {
+        setBusy(false);
+        return setErr(/registered/i.test(error.message)
+          ? "This mobile number has not been added by the Owner yet."
+          : "Could not create the sign-in: " + error.message);
+      }
+      const r2 = await sbSignIn(m, pin);
+      setBusy(false);
+      if (r2.error) return setErr("Your PIN was created — now use the Sign in tab.");
+      await onIn();
+    }
+  };
+  return (
+    <div className="login">
+      <div className="login-card">
+        <div className="login-brand"><Mark size={44} /><h1>Revanza</h1><p>Office Task Manager</p></div>
+        <div className="statusbar" style={{ marginTop: 0 }}>
+          <button className={`chip${tab === "in" ? " on" : ""}`} onClick={() => { setTab("in"); setErr(""); }}>Sign in</button>
+          <button className={`chip${tab === "up" ? " on" : ""}`} onClick={() => { setTab("up"); setErr(""); }}>First time — create my PIN</button>
+        </div>
+        <form onSubmit={submit}>
+          <Field label="Registered mobile number">
+            <input inputMode="numeric" value={mobile} onChange={(e) => setMobile(e.target.value)} placeholder="10-digit mobile number" autoComplete="username" />
+          </Field>
+          <Field label="4-digit PIN">
+            <input type="password" inputMode="numeric" maxLength={4} value={pin} onChange={(e) => setPin(e.target.value)} placeholder="••••" autoComplete={tab === "in" ? "current-password" : "new-password"} />
+          </Field>
+          {tab === "up" && (
+            <Field label="Confirm PIN">
+              <input type="password" inputMode="numeric" maxLength={4} value={pin2} onChange={(e) => setPin2(e.target.value)} placeholder="••••" />
+            </Field>
+          )}
+          {err && <p className="err">{err}</p>}
+          <Btn kind="solid" type="submit" full disabled={busy}>{busy ? "Please wait…" : tab === "in" ? "Sign in" : "Create PIN and sign in"}</Btn>
+        </form>
+        <p className="login-note">
+          Only mobile numbers added by the Owner can sign in. First-time users choose their own PIN.
+          Forgot your PIN? Ask the Owner to reset it.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function Login({ db, commit, onIn }) {
   const [mobile, setMobile] = useState("");
   const [pin, setPin] = useState("");
@@ -651,20 +754,24 @@ function Login({ db, commit, onIn }) {
 
 function ChangePin({ user, commit, first, onDone, onClose }) {
   const [a, setA] = useState(""); const [b, setB] = useState(""); const [old, setOld] = useState(""); const [err, setErr] = useState("");
-  const save = (e) => {
+  const save = async (e) => {
     e.preventDefault();
-    if (!first && old !== user.pin) return setErr("Current PIN is incorrect.");
+    if (!first && !LIVE && old !== user.pin) return setErr("Current PIN is incorrect.");
     if (!/^\d{4}$/.test(a)) return setErr("The PIN must be exactly 4 digits.");
     if (a !== b) return setErr("The two PINs do not match.");
-    if (a === "1234") return setErr("Choose a PIN other than the temporary one.");
-    commit((d) => { const u = d.users.find((x) => x.id === user.id); u.pin = a; u.mustChangePin = false; },
+    if (!LIVE && a === "1234") return setErr("Choose a PIN other than the temporary one.");
+    if (LIVE) {
+      const { error } = await sbChangePin(a);
+      if (error) return setErr(error.message);
+    }
+    commit((d) => { const u = d.users.find((x) => x.id === user.id); if (!LIVE) u.pin = a; u.mustChangePin = false; },
       { by: user.name, action: "PIN changed", detail: "" });
     onDone && onDone(); onClose && onClose();
   };
   const body = (
     <form onSubmit={save} className="pin-form">
       {first && <p className="notice">You are signed in with a temporary PIN. Set a new one to continue.</p>}
-      {!first && <Field label="Current PIN"><input type="password" maxLength={4} inputMode="numeric" value={old} onChange={(e) => setOld(e.target.value)} /></Field>}
+      {!first && !LIVE && <Field label="Current PIN"><input type="password" maxLength={4} inputMode="numeric" value={old} onChange={(e) => setOld(e.target.value)} /></Field>}
       <Field label="New 4-digit PIN"><input type="password" maxLength={4} inputMode="numeric" value={a} onChange={(e) => setA(e.target.value)} /></Field>
       <Field label="Confirm new PIN"><input type="password" maxLength={4} inputMode="numeric" value={b} onChange={(e) => setB(e.target.value)} /></Field>
       {err && <p className="err">{err}</p>}
@@ -1733,7 +1840,7 @@ function Directory({ db, user, commit, flash }) {
             <thead><tr><th>Name</th><th>Role</th><th>Department</th><th>Email</th><th>Mobile</th><th>Status</th>{isOwner && <th></th>}</tr></thead>
             <tbody>{sorted.map((u) => (
               <tr key={u.id}>
-                <td><b>{u.name}</b><i className="sub mono">{u.id}</i></td><td>{u.role}</td><td>{u.dept}</td>
+                <td><b>{u.name}</b><i className="sub mono">{u.empCode || u.id}</i></td><td>{u.role}</td><td>{u.dept}</td>
                 <td className={u.email === PENDING ? "muted" : ""}>{u.email}</td>
                 <td className={u.mobile === PENDING ? "muted" : ""}>{u.mobile}</td>
                 <td><Badge t={u.status === "Active" ? "green" : "grey"}>{u.status}</Badge>{u.locked && <Badge t="red">Locked</Badge>}</td>
@@ -1765,6 +1872,7 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
     flash("Saved"); onClose();
   };
   const resetPin = () => {
+    if (LIVE) return flash("In live mode, reset a staff PIN from the Supabase dashboard: Authentication → Users → select the user → update password (their new PIN + the app suffix — see the README)");
     commit((d) => { const x = d.users.find((y) => y.id === u.id); x.pin = "1234"; x.mustChangePin = true; x.locked = false; x.failed = 0; },
       { by: user.name, action: "PIN reset", detail: u.name });
     flash(`${u.name}'s PIN reset to 1234 — they must change it at next sign-in`);
@@ -1826,9 +1934,10 @@ function AddUser({ db, user, commit, flash, onClose }) {
   const save = () => {
     if (!f.name.trim()) return flash("A name is required");
     if (f.mobile && db.users.some((u) => u.mobile === f.mobile)) return flash("That mobile number is already registered");
-    const id = "EMP" + pad(db.users.length + 1);
+    const empCode = "EMP" + pad(db.users.length + 1);
+    const id = LIVE ? crypto.randomUUID() : empCode;
     commit((d) => d.users.push({
-      id, name: f.name, role: f.role, dept: f.dept || "—", designation: f.role,
+      id, empCode, name: f.name, role: f.role, dept: f.dept || "—", designation: f.role,
       email: f.email || PENDING, mobile: f.mobile || PENDING, altMobile: PENDING, manager: "Sushil",
       doj: today(), status: "Active", pin: "1234", mustChangePin: true, failed: 0, locked: false, logins: [],
       workStart: "09:30", workEnd: "18:30", graceMins: 15, weeklyOff: "Sunday", locationId: "LOC1",
@@ -1919,6 +2028,7 @@ function Settings({ db, user, commit, flash }) {
     flash("Coordinates filled from your current position");
   }, () => flash("Could not read your location"));
   const reset = () => {
+    if (LIVE) return flash("Reset is disabled in live mode — the data is shared by the whole office");
     if (!window.confirm("This clears all tasks, cases, attendance and leave, and restores the sample data. Continue?")) return;
     const fresh = seedDB(); saveDB(fresh); window.location.reload();
   };
@@ -1937,13 +2047,22 @@ function Settings({ db, user, commit, flash }) {
         </Panel>
       )}
       <Panel title="About this build">
-        <p className="notice warnbox">
-          <b>Prototype — do not load real employee, salary or case data.</b> Everything is stored unencrypted in this
-          browser session's storage. Sign-in, PINs and role restrictions here are interface behaviour, not enforced
-          security: anyone who can open this app can read all of the data behind it. OTP, WhatsApp, email and Google
-          Calendar sync are not connected — those need a server. Use this to agree the workflow, then hand the agreed
-          screens to a developer for a proper build.
-        </p>
+        {LIVE ? (
+          <p className="notice">
+            <b>Live mode.</b> Data is shared across the whole office through your Supabase project, sign-in is real
+            authentication, and access rules are enforced by the database itself: payroll is Owner-only, legal cases are
+            visible only to the Owner and Legal Associates, staff can only write their own attendance and leave, and
+            completed tasks are locked against staff changes at the server. Still pending as server work: WhatsApp,
+            email and OTP sending, and Google Calendar sync. Staff PIN resets are done from the Supabase dashboard
+            (Authentication → Users).
+          </p>
+        ) : (
+          <p className="notice warnbox">
+            <b>Demo mode — do not load real employee, salary or case data.</b> Everything is stored unencrypted in this
+            browser only and is not shared between devices. Add the two Supabase environment variables (see the README)
+            and this same build switches into live shared mode with real sign-in.
+          </p>
+        )}
         {isOwner && <div className="danger-zone"><Btn onClick={reset}>Reset workspace to sample data</Btn></div>}
       </Panel>
     </>

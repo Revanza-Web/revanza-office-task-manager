@@ -45,6 +45,44 @@ git push -u origin main
 
 Every time you push changes to GitHub, Vercel redeploys automatically.
 
+
+## GOING LIVE (shared data + real sign-in) — about 15 minutes
+
+The app has two modes. Without the two environment variables below it runs as a single-device demo. With them, it becomes the live office system: one shared database, real authentication, and permissions enforced by the database (payroll Owner-only, legal cases Owner + Legal Associates only, staff can only write their own attendance/leave, completed tasks locked at the server).
+
+### Step 1 — Create the database (free)
+1. Go to https://supabase.com → sign in with GitHub → **New project**.
+2. Name it `revanza-rotm`, choose the region closest to Chennai (Mumbai / `ap-south-1`), set any strong database password (you won't need it day-to-day), and create.
+
+### Step 2 — Load the schema
+1. In the Supabase project, open **SQL Editor → New query**.
+2. Open the file `supabase/schema.sql` from this project, copy ALL of it, paste, and click **Run**.
+3. You should see "Success". This creates every table, all the permission rules, and the 15 Revanza staff.
+
+### Step 3 — Auth settings
+1. Go to **Authentication → Sign In / Providers → Email**.
+2. Turn **OFF** "Confirm email" (sign-ins are by mobile number + PIN; there are no real inboxes). Save.
+
+### Step 4 — Connect the app
+1. In Supabase: **Project Settings → API**. Copy the **Project URL** and the **anon public** key.
+2. On Vercel: your project → **Settings → Environment Variables** → add:
+   - `VITE_SUPABASE_URL` = the Project URL
+   - `VITE_SUPABASE_ANON_KEY` = the anon key
+3. Redeploy (Deployments → ⋯ → Redeploy). For local use, copy `.env.example` to `.env` and fill the same two values.
+
+### Step 5 — First sign-ins
+- Open the site → **"First time — create my PIN"** → mobile `9841344444` → choose your PIN. That's you (Owner).
+- Staff do the same with their own numbers — but only numbers you have added can register. Most staff numbers are still "Pending Information": open **Employee Directory → Manage** and fill in each person's real mobile number first.
+
+### Day-to-day notes for live mode
+- **Forgot/reset a staff PIN:** Supabase dashboard → Authentication → Users → select the user → update password. The stored password is their PIN followed by `@Rvz#26` (e.g. PIN 5081 → `5081@Rvz#26`).
+- **Deactivate someone:** Employee Directory → Manage → Deactivate (they can no longer use the app even if signed in elsewhere after refresh).
+- **Backups:** Supabase → Database → Backups (daily on free tier).
+- Changes made by one person appear for others within ~45 seconds or on switching back to the app.
+
+### Still not included (needs paid services + server functions)
+WhatsApp/SMS sending (Twilio/WhatsApp Business API), automatic emails to md@revanza.in, OTP login, and Google Calendar sync. The app shows the 11:30 reminder queue and daily summary so nothing is missed manually; wiring the actual sending is the next phase (Supabase Edge Functions + Twilio + an email provider).
+
 ## Camera and GPS
 
 Attendance requires a photograph and reads GPS. Browsers only allow camera/location on **https** (Vercel provides this) or on `localhost` — so both work; a plain `http://` server on your office network will not.
