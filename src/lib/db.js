@@ -5,7 +5,7 @@
    ============================================================ */
 import { createClient } from "@supabase/supabase-js";
 
-const url = "https://YOURPROJECT.supabase.co";
+const url = "https://okwvvmohafnmgkmptigg.supabase.co/rest/v1/";
 const anon = "eyJhbGc...your-long-anon-key...";
 export const LIVE = Boolean(url && anon);
 export const supabase = LIVE ? createClient(url, anon) : null;
