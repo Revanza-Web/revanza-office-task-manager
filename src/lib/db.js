@@ -16,7 +16,7 @@ const OWNER = "Owner / Super Admin";
 /* Sign-in identity: Supabase auth accounts keyed on the mobile number.
    The fixed suffix only satisfies the minimum password length —
    the real secret is the user's PIN. Recommend 6-digit PINs later. */
-const emailFor = (mobile) => `${mobile}@rotm.revanza.app`;
+const emailFor = (mobile) => `${mobile}@revanza.in`;
 const pwFor = (pin) => `${pin}@Rvz#26`;
 
 export async function sbSession() {
