@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { LIVE, sbSession, sbSignIn, sbSignUp, sbChangePin, sbSignOut, fetchAll, syncDB } from "./lib/db.js";
 import * as XLSX from "xlsx";
-import * as XLSX from "xlsx";
 
 /* ============================================================
    REVANZA OFFICE TASK MANAGER — working prototype console
