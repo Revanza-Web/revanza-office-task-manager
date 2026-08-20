@@ -49,13 +49,17 @@ const OWNER = "Owner / Super Admin";
 const NAV = [
   { id: "dashboard", label: "Dashboard", roles: "*" },
   { id: "tasks", label: "Tasks", roles: "*" },
+  { id: "projects", label: "Projects", roles: "*" },
   { id: "attendance", label: "Attendance", roles: "*" },
   { id: "leave", label: "Leave", roles: "*" },
   { id: "cases", label: "Legal Cases", roles: [OWNER, "Legal Associate"] },
+  { id: "accounts", label: "Accounts", roles: [OWNER, "Payments"] },
   { id: "calendar", label: "Calendar", roles: "*" },
   { id: "alerts", label: "Alerts", roles: "*" },
+  { id: "notifications", label: "Notifications", roles: "*" },
   { id: "directory", label: "Employee Directory", roles: "*" },
   { id: "reports", label: "Reports", roles: [OWNER, "Accounts", "Admin"] },
+  { id: "salary", label: "Salary", roles: [OWNER] },
   { id: "audit", label: "Audit Log", roles: [OWNER] },
   { id: "settings", label: "Settings", roles: "*" },
 ];
@@ -103,6 +107,136 @@ function compressImage(file, maxW = 420, q = 0.6) {
     img.onerror = reject;
     img.src = URL.createObjectURL(file);
   });
+}
+
+/* ---------- bank statement helpers ---------- */
+const inr = (n) => "₹ " + (Number(n) || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+function parseCSV(text) {
+  const rows = []; let row = [], val = "", inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { val += '"'; i++; } else inQ = false; }
+      else val += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ",") { row.push(val); val = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(val); val = "";
+      if (row.some((x) => x.trim() !== "")) rows.push(row);
+      row = [];
+    } else val += c;
+  }
+  row.push(val);
+  if (row.some((x) => x.trim() !== "")) rows.push(row);
+  return rows;
+}
+const MONTHS3 = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+function parseBankDate(sv) {
+  const x = (sv || "").trim();
+  let m = x.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return `${m[1]}-${pad(+m[2])}-${pad(+m[3])}`;
+  m = x.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  if (m) { const y = m[3].length === 2 ? "20" + m[3] : m[3]; return `${y}-${pad(+m[2])}-${pad(+m[1])}`; } // Indian banks: day first
+  m = x.match(/^(\d{1,2})[- ]([A-Za-z]{3})[a-z]*[- ,]+(\d{2,4})/);
+  if (m) { const mo = MONTHS3[m[2].toLowerCase().slice(0, 3)]; const y = m[3].length === 2 ? "20" + m[3] : m[3]; if (mo) return `${y}-${pad(mo)}-${pad(+m[1])}`; }
+  return null;
+}
+const parseAmt = (sv) => { const n = parseFloat(String(sv || "").replace(/[^0-9.\-]/g, "")); return isNaN(n) ? 0 : n; };
+
+/* ---------- salary engine ---------- */
+const HR_DEFAULTS = { latesPerHalfDay: 3, leaveUnpaid: true, leaveExtraThreshold: 5, leaveExtraDays: 2 };
+const daysInMonth = (ym) => { const [y, m] = ym.split("-").map(Number); return new Date(y, m, 0).getDate(); };
+const DOW = { Sunday: 0, Monday: 1, Tuesday: 2, Wednesday: 3, Thursday: 4, Friday: 5, Saturday: 6 };
+
+function calcSalary(db, u, ym) {
+  const hr = { ...HR_DEFAULTS, ...(db.settings.hr || {}) };
+  const dim = daysInMonth(ym);
+  const t = today();
+  const perDay = (Number(u.salary) || 0) / dim;
+  const start = u.salaryStartDate && u.salaryStartDate.slice(0, 7) === ym ? Number(u.salaryStartDate.slice(8, 10)) : 1;
+  const beforeStart = u.salaryStartDate && u.salaryStartDate.slice(0, 7) > ym;
+  const afterEnd = u.salaryEndDate && u.salaryEndDate.slice(0, 7) < ym;
+  const endCap = u.salaryEndDate && u.salaryEndDate.slice(0, 7) === ym ? Number(u.salaryEndDate.slice(8, 10)) : dim;
+  const lastCounted = ym === t.slice(0, 7) ? Number(t.slice(8, 10)) : ym > t.slice(0, 7) ? 0 : dim;
+  const upto = Math.min(endCap, lastCounted);
+  const offDow = DOW[u.weeklyOff || "Sunday"] ?? 0;
+  const days = [];
+  let present = 0, absent = 0, leaveDays = 0, lates = 0, offWorked = 0, otMins = 0, graceEaten = 0;
+  if (!beforeStart && !afterEnd) {
+    for (let d0 = start; d0 <= upto; d0++) {
+      const date = `${ym}-${pad(d0)}`;
+      const dow = new Date(date + "T00:00:00").getDay();
+      const a = db.attendance.find((x) => x.userId === u.id && x.date === date);
+      const onLeave = db.leaves.some((l) => l.userId === u.id && l.status === "Approved" && l.from <= date && l.to >= date);
+      let status, otToday = 0;
+      if (dow === offDow) {
+        if (a) { offWorked++; status = "Weekly off — worked (+1 day)"; } else status = "Weekly off";
+      } else if (onLeave) { leaveDays++; status = "Approved leave"; }
+      else if (!a) { absent++; status = "Absent"; }
+      else {
+        present++;
+        const inM = minsSinceMidnight(a.inTs), ws = hhmmToMins(u.workStart || "09:30"), grace = Number(u.graceMins) || 0;
+        if (inM > ws + grace) { lates++; status = "Present — late"; }
+        else { status = "Present"; if (inM > ws) graceEaten += inM - ws; }
+        if (a.outTs) { const om = minsSinceMidnight(a.outTs) - hhmmToMins(u.workEnd || "18:30"); if (om > 0) { otMins += om; otToday = om; } }
+      }
+      days.push({ date, status, inT: a ? fmtTime(a.inTs) : "", outT: a && a.outTs ? fmtTime(a.outTs) : "", ot: otToday });
+    }
+  }
+  const halfDays = Math.floor(lates / (hr.latesPerHalfDay || 3)) * 0.5;
+  const leaveDeduct = hr.leaveUnpaid ? leaveDays + (leaveDays >= (hr.leaveExtraThreshold || 5) ? (hr.leaveExtraDays || 2) : 0) : 0;
+  const otNetMins = Math.max(0, otMins - graceEaten);
+  const otPay = (otNetMins / 60) * (Number(u.incentivePerHour) || 0);
+  const base = beforeStart || afterEnd || upto < start ? 0 : (Number(u.salary) || 0) * (upto - start + 1) / dim;
+  const dedDays = absent + halfDays + leaveDeduct;
+  const net = Math.max(0, base - dedDays * perDay + offWorked * perDay + otPay);
+  return { dim, upto, start, perDay, present, absent, leaveDays, leaveDeduct, lates, halfDays, offWorked, otMins, graceEaten, otNetMins, otPay, base, dedDays, net, days };
+}
+
+/* ---------- project schedule engine ----------
+   A task whose linked (depends-on) tasks are late or incomplete
+   cannot start on time; it and its subtasks are pushed forward,
+   chains cascade, and everyone connected is notified. */
+function cascadeSchedule(d, projectId, actor) {
+  const t = today();
+  const proj = d.projects.find((p) => p.id === projectId);
+  const tasks = d.ptasks.filter((x) => x.projectId === projectId);
+  const byId = {}; tasks.forEach((x) => { byId[x.id] = x; });
+  const shifted = [];
+  for (let pass = 0; pass < 12; pass++) {
+    let changed = false;
+    tasks.forEach((x) => {
+      if ((x.percent || 0) >= 100 || !(x.dependsOn || []).length) return;
+      let minStart = null;
+      (x.dependsOn || []).forEach((did) => {
+        const dep = byId[did]; if (!dep) return;
+        const effEnd = (dep.percent || 0) >= 100 ? dep.end : (dep.end < t ? t : dep.end);
+        const ns = addDays(effEnd, 1);
+        if (!minStart || ns > minStart) minStart = ns;
+      });
+      if (minStart && x.start < minStart) {
+        const delta = dayDiff(x.start, minStart);
+        x.origEnd = x.origEnd || x.end;
+        x.start = addDays(x.start, delta);
+        x.end = addDays(x.end, delta);
+        (x.subtasks || []).forEach((st) => {
+          if (st.start) st.start = addDays(st.start, delta);
+          if (st.end) st.end = addDays(st.end, delta);
+        });
+        shifted.push({ x, delta });
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+  if (shifted.length && proj) {
+    const audience = [d.users.find((u) => u.role === OWNER)?.id, ...(proj.team || []), ...(proj.contractors || [])];
+    shifted.forEach(({ x, delta }) =>
+      pushNotify(d, audience, `Project "${proj.name}": "${x.name}" pushed by ${delta} day(s) to ${fmtDate(x.end)} because a linked task is delayed or incomplete`, "Project delay", null));
+    d.audit.unshift({ ts: Date.now(), by: actor, action: "Project schedule shifted", detail: `${proj.name}: ${shifted.length} task(s) moved` });
+  }
+  return shifted.length;
 }
 
 /* ---------- seed data ---------- */
@@ -244,9 +378,17 @@ function seedDB() {
       caseStages: [],
       nextActions: [...NEXT_ACTIONS],
       leaveReasons: ["Family function", "Medical", "Personal work", "Travel"],
+      caseTypes: ["Consumer complaint", "Suit for injunction", "Writ petition"],
+      ledgers: ["EB / utilities", "Professional fees", "Rent", "Salaries", "Sales advance", "Vendor payment"],
+      categories: ["Capital", "Direct expense", "Income", "Indirect expense", "Transfer"],
     },
     locations: [{ id: "LOC1", name: "Head Office — Chennai", lat: 13.0827, lng: 80.2707, radiusM: 250 }],
     holidays: [],
+    notifications: [],
+    accounts: [],
+    entries: [],
+    projects: [],
+    ptasks: [],
     audit: [{ ts: Date.now(), by: "system", action: "Workspace created", detail: "Seed users and sample records loaded" }],
     settings: { morningDue: "10:30", ownerEmail: "md@revanza.in" },
   };
@@ -267,6 +409,12 @@ async function saveDB(db) {
 const isOverdue = (t) => t.status !== "Completed" && t.due && t.due < today();
 const openTasks = (tasks) => tasks.filter((t) => t.status !== "Completed");
 const attFor = (db, userId, date) => db.attendance.find((a) => a.userId === userId && a.date === date);
+const taskAssignees = (t) => (t.assignees && t.assignees.length ? t.assignees : [t.assignedTo].filter(Boolean));
+const mineTask = (t, id) => taskAssignees(t).includes(id);
+function pushNotify(d, userIds, text, kind, ref) {
+  [...new Set(userIds.filter(Boolean))].forEach((u2) =>
+    d.notifications.unshift({ id: uid("n"), userId: u2, ts: Date.now(), text, kind, ref: ref || null, read: false }));
+}
 const uname = (db, id) => db.users.find((u) => u.id === id)?.name || "—";
 const urole = (db, id) => db.users.find((u) => u.id === id)?.role || "";
 
@@ -274,7 +422,7 @@ function buildAlerts(db) {
   const t = today();
   const out = [];
   const push = (sev, type, who, subject, action, ref) => out.push({ id: uid("al"), sev, type, who, subject, action, ref, ts: Date.now() });
-  db.users.filter((u) => u.status === "Active" && u.role !== OWNER).forEach((u) => {
+  db.users.filter((u) => u.status === "Active" && u.role !== OWNER && u.role !== "Contractor").forEach((u) => {
     const a = attFor(db, u.id, t);
     const onLeave = db.leaves.some((l) => l.status === "Approved" && l.from <= t && l.to >= t && l.userId === u.id);
     if (onLeave) return;
@@ -491,6 +639,15 @@ export default function App() {
       }
       let d = await loadDB();
       if (!d) { d = seedDB(); await saveDB(d); }
+      if (!d.notifications) d.notifications = [];
+      if (!d.masters.caseTypes) d.masters.caseTypes = ["Consumer complaint", "Suit for injunction", "Writ petition"];
+      if (!d.accounts) d.accounts = [];
+      if (!d.entries) d.entries = [];
+      if (!d.masters.ledgers) d.masters.ledgers = ["Rent", "Salaries", "Vendor payment"];
+      if (!d.masters.categories) d.masters.categories = ["Direct expense", "Income", "Transfer"];
+      if (!d.settings.hr) d.settings.hr = { ...HR_DEFAULTS };
+      if (!d.projects) d.projects = [];
+      if (!d.ptasks) d.ptasks = [];
       setDb(d);
       try {
         const sv = localStorage.getItem(SESSION_KEY);
@@ -552,8 +709,14 @@ export default function App() {
   if (user.mustChangePin) return (<><Styles /><ChangePin user={user} commit={commit} first onDone={() => flash("PIN changed")} /></>);
 
   const isOwner = user.role === OWNER;
+  const isContractor = user.role === "Contractor";
+  const contractorViews = ["projects", "notifications", "settings"];
   const myAlerts = isOwner ? alerts : alerts.filter((a) => a.who === user.name);
-  const nav = NAV.filter((n) => allowed(n, user.role));
+  const unreadNotifs = (db.notifications || []).filter((x) => x.userId === user.id && !x.read).length;
+  const nav = NAV.filter((n) => allowed(n, user.role)).filter((n) => !isContractor || contractorViews.includes(n.id));
+  useEffect(() => {
+    if (user && user.role === "Contractor" && !["projects", "notifications", "settings"].includes(view)) setView("projects");
+  }, [me, view, user]);
 
   return (
     <>
@@ -569,6 +732,7 @@ export default function App() {
               <button key={n.id} className={`nav${view === n.id ? " on" : ""}`} onClick={() => go(n.id)}>
                 {n.label}
                 {n.id === "alerts" && myAlerts.length > 0 && <em className="pip">{myAlerts.length}</em>}
+                {n.id === "notifications" && unreadNotifs > 0 && <em className="pip">{unreadNotifs}</em>}
               </button>
             ))}
           </nav>
@@ -586,9 +750,11 @@ export default function App() {
               <h1>{NAV.find((n) => n.id === view)?.label}</h1>
               <p>{new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}</p>
             </div>
-            <button className="top-alert" onClick={() => go("alerts")}>
-              Alerts{myAlerts.length > 0 && <em className="pip">{myAlerts.length}</em>}
-            </button>
+            {!isContractor && (
+              <button className="top-alert" onClick={() => go("alerts")}>
+                Alerts{myAlerts.length > 0 && <em className="pip">{myAlerts.length}</em>}
+              </button>
+            )}
           </header>
 
           <div className="canvas">
@@ -601,6 +767,10 @@ export default function App() {
             {view === "cases" && <Cases db={db} user={user} commit={commit} flash={flash} preset={preset} focus={focus} />}
             {view === "calendar" && <CalendarView db={db} user={user} go={go} />}
             {view === "alerts" && <Alerts alerts={myAlerts} go={go} />}
+            {view === "notifications" && <Notifications db={db} user={user} commit={commit} go={go} />}
+            {view === "accounts" && <Accounts db={db} user={user} commit={commit} flash={flash} />}
+            {view === "salary" && <Salary db={db} user={user} commit={commit} flash={flash} />}
+            {view === "projects" && <Projects db={db} user={user} commit={commit} flash={flash} />}
             {view === "directory" && <Directory db={db} user={user} commit={commit} flash={flash} />}
             {view === "reports" && <Reports db={db} user={user} />}
             {view === "audit" && <AuditLog db={db} />}
@@ -790,7 +960,7 @@ function ChangePin({ user, commit, first, onDone, onClose }) {
 /* ============================ OWNER DASHBOARD ============================ */
 function OwnerDash({ db, alerts, go, commit, user, flash }) {
   const t = today();
-  const staff = db.users.filter((u) => u.status === "Active" && u.role !== OWNER);
+  const staff = db.users.filter((u) => u.status === "Active" && u.role !== OWNER && u.role !== "Contractor");
   const present = staff.filter((u) => attFor(db, u.id, t));
   const onLeave = staff.filter((u) => db.leaves.some((l) => l.userId === u.id && l.status === "Approved" && l.from <= t && l.to >= t));
   const absent = staff.filter((u) => !attFor(db, u.id, t) && !onLeave.includes(u));
@@ -887,6 +1057,30 @@ function OwnerDash({ db, alerts, go, commit, user, flash }) {
         )}
       </Panel>
 
+      <Panel title="Staff overview" sub="Tap Open for that person's full task list and report" pad={false}>
+        <ul className="board">
+          {staff.map((u) => {
+            const uAll = db.tasks.filter((x) => taskAssignees(x).includes(u.id));
+            const uOpen = uAll.filter((x) => x.status !== "Completed");
+            const uOver = uAll.filter(isOverdue);
+            const a = attFor(db, u.id, t);
+            return (
+              <li key={u.id} className={`board-row${uOver.length ? " r-orange" : ""}`}>
+                <div className="board-main">
+                  <span className="board-type">{u.role}</span>
+                  <span className="board-sub">{u.name}</span>
+                </div>
+                <div className="board-meta">
+                  <span className="board-who">{uOpen.length} open{uOver.length ? ` · ${uOver.length} overdue` : ""}</span>
+                  <span className="board-act">{a ? `In ${fmtTime(a.inTs)}` : "Not checked in"}</span>
+                </div>
+                <Btn onClick={() => go("tasks", { who: u.id })}>Open</Btn>
+              </li>
+            );
+          })}
+        </ul>
+      </Panel>
+
       <div className="two">
         <Panel title="Daily update status" sub={`Morning updates are due by ${db.settings.morningDue}`}>
           <table className="tbl">
@@ -952,7 +1146,7 @@ function OwnerDash({ db, alerts, go, commit, user, flash }) {
 /* ============================ STAFF DASHBOARD ============================ */
 function StaffDash({ db, user, go, commit, flash }) {
   const t = today();
-  const mine = db.tasks.filter((x) => x.assignedTo === user.id);
+  const mine = db.tasks.filter((x) => mineTask(x, user.id));
   const a = attFor(db, user.id, t);
   const myCases = db.cases.filter((c) => c.associate === user.id);
   const [modal, setModal] = useState(null);
@@ -1062,15 +1256,15 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
   const t = today();
   const [q, setQ] = useState("");
   const [status, setStatus] = useState(preset?.status ?? "");
-  const [who, setWho] = useState("");
+  const [who, setWho] = useState(preset?.who ?? "");
   const [quick, setQuick] = useState(preset?.quick ?? "");
   const [open, setOpen] = useState(focus?.kind === "task" ? focus.id : null);
   const [creating, setCreating] = useState(false);
 
-  let rows = isOwner ? db.tasks : db.tasks.filter((x) => x.assignedTo === user.id);
+  let rows = isOwner ? db.tasks : db.tasks.filter((x) => mineTask(x, user.id));
   rows = rows.filter((x) => {
     if (status && x.status !== status) return false;
-    if (who && x.assignedTo !== who) return false;
+    if (who && !taskAssignees(x).includes(who)) return false;
     if (quick === "overdue" && !isOverdue(x)) return false;
     if (quick === "today" && !(x.due === t && x.status !== "Completed")) return false;
     if (quick === "week" && !(x.due >= t && dayDiff(t, x.due) <= 7 && x.status !== "Completed")) return false;
@@ -1105,6 +1299,20 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
           </select>
           {(q || status || who || quick) && <Btn onClick={() => { setQ(""); setStatus(""); setWho(""); setQuick(""); }}>Clear</Btn>}
         </div>
+        {isOwner && who && (() => {
+          const wT = db.tasks.filter((x) => taskAssignees(x).includes(who));
+          const a = attFor(db, who, t);
+          return (
+            <div className="kv" style={{ borderBottom: "none", paddingTop: 0 }}>
+              <div><span>Employee report</span><b>{uname(db, who)} — {urole(db, who)}</b></div>
+              <div><span>Attendance today</span><b>{a ? `In ${fmtTime(a.inTs)}${a.outTs ? ` · out ${fmtTime(a.outTs)}` : ""}` : "Not checked in"}</b></div>
+              <div><span>Open tasks</span><b>{wT.filter((x) => x.status !== "Completed").length}</b></div>
+              <div><span>Overdue</span><b className={wT.filter(isOverdue).length ? "danger" : ""}>{wT.filter(isOverdue).length}</b></div>
+              <div><span>Facing issues / stopped</span><b>{wT.filter((x) => x.status === "Facing Issues" || x.status === "Stopped").length}</b></div>
+              <div><span>Completed</span><b>{wT.filter((x) => x.status === "Completed").length}</b></div>
+            </div>
+          );
+        })()}
         {rows.length === 0 ? <Empty>No tasks match these filters. Clear them to see everything.</Empty> : (
           <div className="scroll-x">
             <table className="tbl">
@@ -1117,7 +1325,10 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
                       <td className="mono">{x.ref}</td>
                       <td><b>{x.name}</b>{x.extension?.status === "Pending" && <i className="sub warn">Extension requested → {fmtDate(x.extension.newDate)}</i>}</td>
                       <td>{x.entity}</td>
-                      <td>{uname(db, x.assignedTo)}<i className="sub">{urole(db, x.assignedTo)}</i></td>
+                      <td>{taskAssignees(x).map((id) => uname(db, id)).join(", ")}
+                        {taskAssignees(x).length === 1
+                          ? <i className="sub">{urole(db, x.assignedTo)}</i>
+                          : <i className="sub">Group · {taskAssignees(x).filter((id) => x.completions && x.completions[id]).length}/{taskAssignees(x).length} confirmed complete</i>}</td>
                       <td>{fmtDate(x.due)}{isOverdue(x) && <i className="sub danger">{dayDiff(x.due, t)}d overdue</i>}</td>
                       <td><Badge>{x.status}</Badge></td>
                       <td className="mono">{x.subtasks.length ? `${done}/${x.subtasks.length}` : "—"}</td>
@@ -1139,23 +1350,63 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
 
 function TaskDetail({ task, db, user, commit, flash, onClose }) {
   const isOwner = user.role === OWNER;
-  const mine = task.assignedTo === user.id;
+  const allIds = taskAssignees(task);
+  const isMine = allIds.includes(user.id);
   const locked = task.status === "Completed" && !isOwner;
+  const ownerId = db.users.find((u) => u.role === OWNER)?.id;
   const [txt, setTxt] = useState("");
+  const [chat, setChat] = useState("");
   const [sub, setSub] = useState("");
   const [subDate, setSubDate] = useState(task.due || today());
   const [ext, setExt] = useState({ on: false, date: "", reason: "" });
   const [edit, setEdit] = useState({ on: false, name: task.name, entity: task.entity, due: task.due, assignedTo: task.assignedTo });
 
   const mutate = (fn, action) => commit((d) => fn(d.tasks.find((x) => x.id === task.id), d), { by: user.name, action, detail: task.ref });
+  const others = (tk) => [tk.assignedBy, ownerId, ...taskAssignees(tk)].filter((x) => x !== user.id);
 
   const addUpdate = (text) => {
     if (!text.trim()) return;
-    mutate((tk) => tk.updates.unshift({ ts: Date.now(), by: user.name, text }), "Task update added");
+    mutate((tk, d) => {
+      tk.updates.unshift({ ts: Date.now(), by: user.name, text });
+      pushNotify(d, others(tk), `${user.name} updated ${tk.ref}: ${text.slice(0, 90)}`, "Task update", { kind: "task", id: tk.id });
+    }, "Task update added");
     flash("Update added");
   };
-  const setStatus = (s) => { mutate((tk) => { tk.status = s; }, `Task status set to ${s}`); flash(`Status set to ${s}`); };
-  const toggleSub = (id) => mutate((tk) => { const s = tk.subtasks.find((y) => y.id === id); s.done = !s.done; }, "Subtask updated");
+  const postChat = () => {
+    if (!chat.trim()) return;
+    const msg = chat;
+    mutate((tk, d) => {
+      tk.comments = tk.comments || [];
+      tk.comments.unshift({ ts: Date.now(), by: user.name, text: msg });
+      pushNotify(d, others(tk), `${user.name} in ${tk.ref} chat: ${msg.slice(0, 90)}`, "Task chat", { kind: "task", id: tk.id });
+    }, "Chat message");
+    setChat("");
+  };
+  const setStatus = (st) => {
+    mutate((tk, d) => {
+      const team = taskAssignees(tk);
+      if (st === "Completed" && !isOwner && team.length > 1) {
+        tk.completions = tk.completions || {};
+        tk.completions[user.id] = Date.now();
+        const remaining = team.filter((id) => !tk.completions[id]);
+        if (remaining.length === 0) tk.status = "Completed";
+        pushNotify(d, others(tk),
+          remaining.length === 0
+            ? `${tk.ref} is now fully completed — every member has confirmed`
+            : `${user.name} marked their part of ${tk.ref} complete (${team.length - remaining.length}/${team.length})`,
+          "Task status", { kind: "task", id: tk.id });
+      } else {
+        tk.status = st;
+        if (st === "Completed") {
+          tk.completions = tk.completions || {};
+          team.forEach((id) => { tk.completions[id] = tk.completions[id] || Date.now(); });
+        }
+        pushNotify(d, others(tk), `${tk.ref} status set to ${st} by ${user.name}`, "Task status", { kind: "task", id: tk.id });
+      }
+    }, `Task status: ${st}`);
+    flash(!isOwner && allIds.length > 1 && st === "Completed" ? "Your completion is recorded" : `Status set to ${st}`);
+  };
+  const toggleSub = (id) => mutate((tk) => { const x = tk.subtasks.find((y) => y.id === id); x.done = !x.done; }, "Subtask updated");
   const addSub = () => {
     if (!sub.trim()) return;
     mutate((tk) => tk.subtasks.push({ id: uid("s"), name: sub, due: subDate, done: false }), "Subtask added");
@@ -1169,39 +1420,49 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
   };
   const requestExt = () => {
     if (!ext.date) return flash("Choose a new completion date");
-    mutate((tk) => {
-      tk.extension = { requested: Date.now(), newDate: ext.date, reason: ext.reason, status: "Pending" };
+    mutate((tk, d) => {
+      tk.extension = { requested: Date.now(), by: user.name, newDate: ext.date, reason: ext.reason, status: "Pending" };
       tk.status = "Delaying Completion Date";
+      pushNotify(d, [tk.assignedBy, ownerId], `${user.name} requested a new completion date for ${tk.ref}: ${fmtDate(ext.date)}`, "Extension", { kind: "task", id: tk.id });
     }, "Extension requested");
     setExt({ on: false, date: "", reason: "" }); flash("Extension request sent to the Owner");
   };
   const decideExt = (ok) => {
-    mutate((tk) => {
+    mutate((tk, d) => {
       tk.extension.status = ok ? "Approved" : "Rejected";
       if (ok) { tk.origDue = tk.origDue || tk.due; tk.due = tk.extension.newDate; }
+      pushNotify(d, taskAssignees(tk), `Completion-date request for ${tk.ref} was ${ok ? "approved" : "rejected"}`, "Extension", { kind: "task", id: tk.id });
     }, `Extension ${ok ? "approved" : "rejected"}`);
     flash(`Extension ${ok ? "approved" : "rejected"}`);
   };
   const saveEdit = () => {
     if (!edit.name.trim() || !edit.entity.trim()) return flash("Task name and property/company are required");
     mutate((tk, d) => {
-      tk.name = edit.name; tk.entity = edit.entity; tk.due = edit.due; tk.assignedTo = edit.assignedTo;
+      tk.name = edit.name; tk.entity = edit.entity; tk.due = edit.due;
       learn(d, "entities", edit.entity);
     }, "Task edited by Owner");
     setEdit({ ...edit, on: false }); flash("Task details updated");
   };
+  const compDone = allIds.filter((id) => task.completions && task.completions[id]).length;
 
   return (
     <Modal title={`${task.ref} — ${task.name}`} onClose={onClose} wide>
       <div className="kv">
         <div><span>Property / company</span><b>{task.entity}</b></div>
-        <div><span>Assigned to</span><b>{uname(db, task.assignedTo)} — {urole(db, task.assignedTo)}</b></div>
+        <div><span>Allocated to</span><b>{allIds.map((id) => uname(db, id)).join(", ")}</b></div>
         <div><span>Assigned by</span><b>{uname(db, task.assignedBy)}</b></div>
         <div><span>Started</span><b>{fmtDate(task.start)}</b></div>
         <div><span>Completion date</span><b>{fmtDate(task.due)}{task.origDue && <i className="sub">was {fmtDate(task.origDue)}</i>}</b></div>
         <div><span>Status</span><b><Badge>{task.status}</Badge></b></div>
       </div>
       {task.desc && <p className="desc">{task.desc}</p>}
+
+      {allIds.length > 1 && (
+        <div className="callout">
+          <span><b>Group task</b> — counts as completed only when every member confirms ({compDone}/{allIds.length}).<br />
+            {allIds.map((id) => `${uname(db, id)} ${task.completions && task.completions[id] ? "✓" : "—"}`).join("  ·  ")}</span>
+        </div>
+      )}
 
       {task.extension?.status === "Pending" && (
         <div className="callout">
@@ -1212,8 +1473,10 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
 
       {!locked && (
         <div className="statusbar">
-          {TASK_STATUS.map((s) => (
-            <button key={s} className={`chip${task.status === s ? " on" : ""}`} onClick={() => setStatus(s)}>{s}</button>
+          {TASK_STATUS.map((st) => (
+            <button key={st} className={`chip${task.status === st ? " on" : ""}`} onClick={() => setStatus(st)}>
+              {st === "Completed" && !isOwner && allIds.length > 1 ? "Mark my part completed" : st}
+            </button>
           ))}
         </div>
       )}
@@ -1226,28 +1489,34 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
             <div className="ext">
               <Field label="Task name"><input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} /></Field>
               <SmartSelect label="Property / company" value={edit.entity} onChange={(v) => setEdit({ ...edit, entity: v })} options={db.masters.entities} />
-              <div className="row2">
-                <Field label="Completion date"><input type="date" value={edit.due} onChange={(e) => setEdit({ ...edit, due: e.target.value })} /></Field>
-                <Field label="Reassign to">
-                  <select value={edit.assignedTo} onChange={(e) => setEdit({ ...edit, assignedTo: e.target.value })}>
-                    {[...db.users].filter((u) => u.status === "Active").sort((a, b) => a.name.localeCompare(b.name))
-                      .map((u) => <option key={u.id} value={u.id}>{u.name} — {u.role}</option>)}
-                  </select>
-                </Field>
-              </div>
+              <Field label="Completion date"><input type="date" value={edit.due} onChange={(e) => setEdit({ ...edit, due: e.target.value })} /></Field>
               <Btn kind="solid" onClick={saveEdit}>Save changes</Btn>
             </div>
           )}
         </>
       )}
 
+      <h4>Task chat</h4>
+      {!locked && (
+        <div className="inline">
+          <input placeholder="Message everyone connected to this task…" value={chat} onChange={(e) => setChat(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && postChat()} />
+          <Btn kind="solid" onClick={postChat}>Send</Btn>
+        </div>
+      )}
+      {(task.comments || []).length === 0 ? <Empty>No messages yet. Everyone allocated to this task, plus the assignor and the Owner, can chat here.</Empty> : (
+        <ul className="feed">{task.comments.map((m, i) => (
+          <li key={i}><span className="feed-m">{m.by} · {fmtStamp(m.ts)}</span>{m.text}</li>))}
+        </ul>
+      )}
+
       <h4>Subtasks</h4>
       {task.subtasks.length === 0 && <Empty>No subtasks yet. Break the work down if it runs over several days.</Empty>}
-      {task.subtasks.map((s) => (
-        <label className="subt" key={s.id}>
-          <input type="checkbox" checked={s.done} disabled={locked} onChange={() => toggleSub(s.id)} />
-          <span className={s.done ? "struck" : ""}>{s.name}</span>
-          {s.due && <span className={`subt-due${!s.done && s.due < today() ? " danger" : ""}`}>due {fmtDate(s.due)}</span>}
+      {task.subtasks.map((x) => (
+        <label className="subt" key={x.id}>
+          <input type="checkbox" checked={x.done} disabled={locked} onChange={() => toggleSub(x.id)} />
+          <span className={x.done ? "struck" : ""}>{x.name}</span>
+          {x.due && <span className={`subt-due${!x.done && x.due < today() ? " danger" : ""}`}>due {fmtDate(x.due)}</span>}
         </label>
       ))}
       {!locked && (
@@ -1261,10 +1530,10 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
       <h4>Photos with GPS</h4>
       {task.docs.length === 0 ? <Empty>No photographs attached to this task.</Empty> : (
         <div className="thumbs">
-          {task.docs.map((d, i) => (
+          {task.docs.map((x, i) => (
             <figure key={i}>
-              <img src={d.img} alt={`Attached by ${d.by}`} className="thumb-lg" />
-              <figcaption>{d.by} · {fmtStamp(d.ts)}<br />{d.lat != null ? `GPS ${d.lat.toFixed(4)}, ${d.lng.toFixed(4)}` : "GPS not captured"}</figcaption>
+              <img src={x.img} alt={`Attached by ${x.by}`} className="thumb-lg" />
+              <figcaption>{x.by} · {fmtStamp(x.ts)}<br />{x.lat != null ? `GPS ${x.lat.toFixed(4)}, ${x.lng.toFixed(4)}` : "GPS not captured"}</figcaption>
             </figure>
           ))}
         </div>
@@ -1285,7 +1554,7 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
         </ul>
       )}
 
-      {mine && !locked && (
+      {isMine && !locked && (
         <>
           <h4>Completion date</h4>
           {!ext.on ? <Btn onClick={() => setExt({ ...ext, on: true })}>Request a new completion date</Btn> : (
@@ -1303,23 +1572,29 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
 }
 
 function AssignTask({ db, user, commit, flash, onClose }) {
-  const [f, setF] = useState({ entity: "", name: "", desc: "", assignedTo: "", start: today(), due: addDays(today(), 3) });
+  const [f, setF] = useState({ entity: "", name: "", desc: "", start: today(), due: addDays(today(), 3) });
+  const [picks, setPicks] = useState([]);
   const [subs, setSubs] = useState([]);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = () => {
     if (!f.entity.trim()) return flash("Property / company is required");
     if (!f.name.trim()) return flash("Task name is required");
-    if (!f.assignedTo) return flash("Choose who the task is allocated to");
+    if (!picks.length) return flash("Select at least one staff member");
     const ref = "TSK-" + pad(db.tasks.length + 1);
+    const idNew = uid("t");
     commit((d) => {
       learn(d, "entities", f.entity);
       d.tasks.push({
-        id: uid("t"), ref, ...f, priority: "Medium", assignedBy: user.id, created: today(), status: "Not Started",
-        subtasks: subs.filter((s) => s.name.trim()).map((s) => ({ id: uid("s"), name: s.name.trim(), due: s.due, done: false })),
+        id: idNew, ref, ...f, assignedTo: picks[0], assignees: picks, completions: {},
+        priority: "Medium", assignedBy: user.id, created: today(), status: "Not Started",
+        subtasks: subs.filter((x) => x.name.trim()).map((x) => ({ id: uid("s"), name: x.name.trim(), due: x.due, done: false })),
         updates: [], comments: [], docs: [], extension: null,
       });
-    }, { by: user.name, action: "Task assigned", detail: `${ref} to ${uname(db, f.assignedTo)}` });
-    flash(`${ref} assigned to ${uname(db, f.assignedTo)}`); onClose();
+      pushNotify(d, picks.filter((x) => x !== user.id),
+        `${user.name} assigned you ${ref} — ${f.name}${picks.length > 1 ? " (group task)" : ""}`,
+        "Task assigned", { kind: "task", id: idNew });
+    }, { by: user.name, action: "Task assigned", detail: `${ref} to ${picks.map((id) => uname(db, id)).join(", ")}` });
+    flash(`${ref} assigned to ${picks.map((id) => uname(db, id)).join(", ")}`); onClose();
   };
   return (
     <Modal title="Assign a task" onClose={onClose}>
@@ -1327,25 +1602,29 @@ function AssignTask({ db, user, commit, flash, onClose }) {
         options={db.masters.entities} hint="Anything added under Others appears in this list next time." />
       <Field label="Task name (required)"><input value={f.name} onChange={set("name")} placeholder="e.g. Collect encumbrance certificate" /></Field>
       <Field label="Task description (optional)"><textarea rows={3} value={f.desc} onChange={set("desc")} /></Field>
-      <Field label="Task allocated to (required)">
-        <select value={f.assignedTo} onChange={set("assignedTo")}>
-          <option value="">Select an employee</option>
-          {[...db.users].filter((u) => u.status === "Active").sort((a, b) => a.name.localeCompare(b.name))
-            .map((u) => <option key={u.id} value={u.id}>{u.name} — {u.role}</option>)}
-        </select>
+      <Field label="Task allocated to — select one or more" hint="Selecting several people makes this a group task: it counts as completed only when every member confirms, and everyone shares the task chat.">
+        <div className="pick">
+          {[...db.users].filter((u) => u.status === "Active").sort((a, b) => a.name.localeCompare(b.name)).map((u) => (
+            <label key={u.id} className="check">
+              <input type="checkbox" checked={picks.includes(u.id)}
+                onChange={(e) => setPicks(e.target.checked ? [...picks, u.id] : picks.filter((x) => x !== u.id))} />
+              {u.name} — {u.role}
+            </label>
+          ))}
+        </div>
       </Field>
       <div className="row2">
         <Field label="Start date" hint="Defaults to today"><input type="date" value={f.start} onChange={set("start")} /></Field>
         <Field label="Completion date"><input type="date" value={f.due} onChange={set("due")} /></Field>
       </div>
       <h4>Subtasks with their own completion dates (optional)</h4>
-      {subs.map((s, i) => (
+      {subs.map((x, i) => (
         <div className="row2" key={i}>
           <Field label={`Subtask ${i + 1}`}>
-            <input value={s.name} onChange={(e) => setSubs(subs.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))} />
+            <input value={x.name} onChange={(e) => setSubs(subs.map((y, j) => (j === i ? { ...y, name: e.target.value } : y)))} />
           </Field>
           <Field label="Completion date">
-            <input type="date" value={s.due} onChange={(e) => setSubs(subs.map((x, j) => (j === i ? { ...x, due: e.target.value } : x)))} />
+            <input type="date" value={x.due} onChange={(e) => setSubs(subs.map((y, j) => (j === i ? { ...y, due: e.target.value } : y)))} />
           </Field>
         </div>
       ))}
@@ -1427,7 +1706,7 @@ function Attendance({ db, user, commit, flash }) {
             <table className="tbl">
               <thead><tr><th>Employee</th><th>Role</th><th>Status</th><th>In</th><th>Photo</th><th>Distance</th><th>Out</th><th>Hours</th><th>Morning</th><th>Evening</th></tr></thead>
               <tbody>
-                {rows.filter(({ u }) => u.role !== OWNER).map(({ u, a }) => {
+                {rows.filter(({ u }) => u.role !== OWNER && u.role !== "Contractor").map(({ u, a }) => {
                   const onLeave = db.leaves.some((l) => l.userId === u.id && l.status === "Approved" && l.from <= date && l.to >= date);
                   const late = a?.inTs && minsSinceMidnight(a.inTs) > hhmmToMins(u.workStart) + u.graceMins;
                   const status = onLeave ? "On Leave" : !a ? "Absent" : late ? "Late" : "Present";
@@ -1482,6 +1761,8 @@ function Leave({ db, user, commit, flash }) {
         reason: f.reason + (f.detail ? ` — ${f.detail}` : ""), days,
         doc: Boolean(f.docImg), docImg: f.docImg, status: "Pending", applied: Date.now(),
       });
+      pushNotify(d, [d.users.find((x) => x.role === OWNER)?.id],
+        `${user.name} applied for ${f.type} leave, ${fmtDate(f.from)} to ${fmtDate(f.to)}`, "Leave", null);
     }, { by: user.name, action: "Leave applied", detail: `${f.type} ${f.from}–${f.to}` });
     setF({ type: "Casual", from: today(), to: today(), reason: "", detail: "", docImg: null });
     flash("Leave request submitted to the Owner");
@@ -1491,6 +1772,7 @@ function Leave({ db, user, commit, flash }) {
       const l = d.leaves.find((x) => x.id === id);
       l.status = ok ? "Approved" : "Rejected"; l.decidedBy = user.name; l.decidedTs = Date.now();
       if (ok) { const u = d.users.find((x) => x.id === l.userId); u.leaveBalance = Math.max(0, u.leaveBalance - l.days); }
+      pushNotify(d, [l.userId], `Your leave (${fmtDate(l.from)} to ${fmtDate(l.to)}) was ${ok ? "approved" : "rejected"} by ${user.name}`, "Leave", null);
     }, { by: user.name, action: `Leave ${ok ? "approved" : "rejected"}`, detail: id });
     flash(`Leave ${ok ? "approved" : "rejected"}`);
   };
@@ -1625,6 +1907,9 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
       x.lastHearing = today(); x.stage = f.stage; x.nextHearing = f.nextHearing;
       x.nextAction = f.nextAction; x.orderCopy = f.orderCopy || f.orderFiles.length > 0; x.orderFiles = f.orderFiles;
       learn(d, "caseStages", f.stage); learn(d, "nextActions", f.nextAction);
+      pushNotify(d, [d.users.find((u) => u.role === OWNER)?.id, x.associate].filter((id) => id !== user.id),
+        `${c.caseNo}: ${f.text.slice(0, 80)}${f.nextHearing ? ` · next hearing ${fmtDate(f.nextHearing)}` : ""}`,
+        "Case update", { kind: "case", id: c.id });
     }, { by: user.name, action: "Case updated", detail: c.caseNo });
     flash("Case updated — the Owner's calendar entry moves with the new hearing date");
     setF({ ...f, text: "" });
@@ -1641,8 +1926,8 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
         <div><span>Court</span><b>{c.court}</b></div>
         <div><span>Bench / judge</span><b>{c.bench} · {c.judge}</b></div>
         <div><span>Type / sections</span><b>{c.type} · {c.sections}</b></div>
-        <div><span>Petitioner</span><b>{c.petitioner}</b></div>
-        <div><span>Respondent</span><b>{c.respondent}</b></div>
+        <div><span>Petitioner(s)</span><b>{[c.petitioner, ...(c.morePetitioners || [])].filter(Boolean).join("; ")}</b></div>
+        <div><span>Respondent(s)</span><b>{[c.respondent, ...(c.moreRespondents || [])].filter(Boolean).join("; ")}</b></div>
         <div><span>Counsel</span><b>{c.counsel}</b></div>
         <div><span>Associate</span><b>{uname(db, c.associate)}</b></div>
         <div><span>Last hearing</span><b>{fmtDate(c.lastHearing)}</b></div>
@@ -1686,37 +1971,65 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
 function AddCase({ db, user, commit, flash, onClose }) {
   const [f, setF] = useState({
     title: "", caseNo: "", type: "", court: "", bench: "", judge: "", sections: "", petitioner: "", respondent: "",
+    morePetitioners: [], moreRespondents: [],
     counsel: "", associate: "", entity: "", stage: "Appearance Stage", status: "", lastHearing: "", nextHearing: "",
     nextAction: "", filingDeadline: "", briefingDate: "", conferenceDate: "", priority: "Medium", risk: "Medium",
   });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const setList = (k, i, v) => setF({ ...f, [k]: f[k].map((x, j) => (j === i ? v : x)) });
   const save = () => {
     if (!f.caseNo.trim() || !f.title.trim() || !f.associate) return flash("Case number, title and associate are required");
     const ref = "CASE-" + pad(db.cases.length + 1);
     commit((d) => {
-      learn(d, "courts", f.court); learn(d, "judges", f.judge); learn(d, "counsels", f.counsel);
-      learn(d, "sections", f.sections); learn(d, "entities", f.entity);
-      d.cases.push({ id: uid("c"), ref, ...f, orderCopy: false, orderFiles: [], updates: [] });
+      learn(d, "caseTypes", f.type); learn(d, "courts", f.court); learn(d, "judges", f.judge);
+      learn(d, "counsels", f.counsel); learn(d, "sections", f.sections); learn(d, "entities", f.entity);
+      d.cases.push({
+        id: uid("c"), ref, ...f,
+        morePetitioners: f.morePetitioners.filter((x) => x.trim()),
+        moreRespondents: f.moreRespondents.filter((x) => x.trim()),
+        orderCopy: false, orderFiles: [], updates: [],
+      });
+      pushNotify(d, [f.associate].filter((id) => id !== user.id), `New case assigned to you: ${f.caseNo} — ${f.title}`, "Case assigned", null);
     }, { by: user.name, action: "Case added", detail: f.caseNo });
     flash(`${f.caseNo} added`); onClose();
   };
   return (
     <Modal title="Add a legal case" onClose={onClose} wide>
+      <Field label="Case title"><input value={f.title} onChange={set("title")} placeholder="e.g. Revanza Estates v. …" /></Field>
       <div className="row2">
         <Field label="Case number"><input value={f.caseNo} onChange={set("caseNo")} placeholder="OS 214/2024" /></Field>
-        <Field label="Case type"><input value={f.type} onChange={set("type")} /></Field>
+        <SmartSelect label="Case type" value={f.type} onChange={(v) => setF({ ...f, type: v })} options={db.masters.caseTypes || []}
+          hint="Anything added under Others joins this list next time." />
       </div>
-      <Field label="Case title"><input value={f.title} onChange={set("title")} /></Field>
+
+      <Field label="Petitioner"><input value={f.petitioner} onChange={set("petitioner")} /></Field>
+      {f.morePetitioners.map((x, i) => (
+        <Field key={"p" + i} label={`Additional petitioner ${i + 2}`}>
+          <input value={x} onChange={(e) => setList("morePetitioners", i, e.target.value)} />
+        </Field>
+      ))}
+      <div className="quick" style={{ marginBottom: 13 }}>
+        <Btn onClick={() => setF({ ...f, morePetitioners: [...f.morePetitioners, ""] })}>Add another petitioner</Btn>
+        {f.morePetitioners.length > 0 && <Btn onClick={() => setF({ ...f, morePetitioners: f.morePetitioners.slice(0, -1) })}>Remove</Btn>}
+      </div>
+
+      <Field label="Respondent"><input value={f.respondent} onChange={set("respondent")} /></Field>
+      {f.moreRespondents.map((x, i) => (
+        <Field key={"r" + i} label={`Additional respondent ${i + 2}`}>
+          <input value={x} onChange={(e) => setList("moreRespondents", i, e.target.value)} />
+        </Field>
+      ))}
+      <div className="quick" style={{ marginBottom: 13 }}>
+        <Btn onClick={() => setF({ ...f, moreRespondents: [...f.moreRespondents, ""] })}>Add another respondent</Btn>
+        {f.moreRespondents.length > 0 && <Btn onClick={() => setF({ ...f, moreRespondents: f.moreRespondents.slice(0, -1) })}>Remove</Btn>}
+      </div>
+
       <SmartSelect label="Court" value={f.court} onChange={(v) => setF({ ...f, court: v })} options={db.masters.courts} />
       <div className="row2">
         <SmartSelect label="Judge" value={f.judge} onChange={(v) => setF({ ...f, judge: v })} options={db.masters.judges} />
         <Field label="Bench"><input value={f.bench} onChange={set("bench")} /></Field>
       </div>
       <SmartSelect label="Applicable sections" value={f.sections} onChange={(v) => setF({ ...f, sections: v })} options={db.masters.sections} />
-      <div className="row2">
-        <Field label="Petitioner"><input value={f.petitioner} onChange={set("petitioner")} /></Field>
-        <Field label="Respondent"><input value={f.respondent} onChange={set("respondent")} /></Field>
-      </div>
       <SmartSelect label="Counsel" value={f.counsel} onChange={(v) => setF({ ...f, counsel: v })} options={db.masters.counsels} />
       <SmartSelect label="Property or company" value={f.entity} onChange={(v) => setF({ ...f, entity: v })} options={db.masters.entities} />
       <Field label="Legal associate responsible">
@@ -1727,13 +2040,10 @@ function AddCase({ db, user, commit, flash, onClose }) {
         </select>
       </Field>
       <div className="row2">
-        <Field label="Stage"><select value={f.stage} onChange={set("stage")}>{CASE_STAGE.map((s) => <option key={s}>{s}</option>)}</select></Field>
+        <Field label="Stage"><select value={f.stage} onChange={set("stage")}>{CASE_STAGE.map((x) => <option key={x}>{x}</option>)}</select></Field>
         <Field label="Next hearing date"><input type="date" value={f.nextHearing} onChange={set("nextHearing")} /></Field>
       </div>
-      <div className="row2">
-        <Field label="Filing deadline"><input type="date" value={f.filingDeadline} onChange={set("filingDeadline")} /></Field>
-        <Field label="Risk level"><select value={f.risk} onChange={set("risk")}><option>High</option><option>Medium</option><option>Low</option></select></Field>
-      </div>
+      <Field label="Filing deadline (if any)"><input type="date" value={f.filingDeadline} onChange={set("filingDeadline")} /></Field>
       <Field label="Next course of action"><input value={f.nextAction} onChange={set("nextAction")} /></Field>
       <Btn kind="solid" full onClick={save}>Add case</Btn>
     </Modal>
@@ -1755,7 +2065,7 @@ function CalendarView({ db, user, go }) {
     const out = [];
     db.cases.filter((c) => c.nextHearing === date && (isOwner || c.associate === user.id))
       .forEach((c) => out.push({ t: "hearing", label: c.caseNo, id: c.id, kind: "case" }));
-    db.tasks.filter((x) => x.due === date && x.status !== "Completed" && (isOwner || x.assignedTo === user.id))
+    db.tasks.filter((x) => x.due === date && x.status !== "Completed" && (isOwner || mineTask(x, user.id)))
       .forEach((x) => out.push({ t: "task", label: x.ref, id: x.id, kind: "task" }));
     db.leaves.filter((l) => l.status === "Approved" && l.from <= date && l.to >= date && (isOwner || l.userId === user.id))
       .forEach((l) => out.push({ t: "leave", label: uname(db, l.userId), id: l.id, kind: "leave" }));
@@ -1814,6 +2124,37 @@ function Alerts({ alerts, go }) {
   );
 }
 
+function Notifications({ db, user, commit, go }) {
+  const mine = (db.notifications || []).filter((n) => n.userId === user.id);
+  const unread = mine.filter((n) => !n.read);
+  const markAll = () => commit((d) => { d.notifications.forEach((n) => { if (n.userId === user.id) n.read = true; }); });
+  const open = (n) => {
+    commit((d) => { const x = d.notifications.find((y) => y.id === n.id); if (x) x.read = true; });
+    if (n.ref) go(n.ref.kind === "case" ? "cases" : "tasks", null, n.ref);
+  };
+  return (
+    <Panel title="Notifications" sub={`${unread.length} unread`} pad={false}
+      right={unread.length > 0 && <Btn onClick={markAll}>Mark all read</Btn>}>
+      {mine.length === 0 ? (
+        <div className="panel-b"><Empty>Nothing yet. You'll be notified here when tasks are assigned to you, statuses change, someone messages a task chat, cases are updated, and leave is decided.</Empty></div>
+      ) : (
+        <ul className="board">
+          {mine.slice(0, 100).map((n) => (
+            <li key={n.id} className={`board-row${n.read ? "" : " r-orange"}`}>
+              <div className="board-main">
+                <span className="board-type">{n.kind || "Update"} · {fmtStamp(n.ts)}</span>
+                <span className="board-sub" style={{ whiteSpace: "normal" }}>{n.text}</span>
+              </div>
+              {n.ref ? <Btn onClick={() => open(n)}>Open</Btn>
+                : !n.read && <Btn onClick={() => commit((d) => { const x = d.notifications.find((y) => y.id === n.id); if (x) x.read = true; })}>Read</Btn>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
 function AuditLog({ db }) {
   return (
     <Panel title="Audit log" sub={`${db.audit.length} entries · newest first`}>
@@ -1867,6 +2208,8 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
         designation: f.designation, workStart: f.workStart, workEnd: f.workEnd,
         graceMins: Number(f.graceMins), radiusM: Number(f.radiusM), leaveBalance: Number(f.leaveBalance),
         salary: f.salary, salaryType: f.salaryType, incentivePerHour: Number(f.incentivePerHour),
+        weeklyOff: f.weeklyOff || "Sunday", salaryStartDate: f.salaryStartDate || "", salaryEndDate: f.salaryEndDate || "",
+        firm: f.firm || "", workType: f.workType || "",
       });
     }, { by: user.name, action: "User record updated", detail: u.name });
     flash("Saved"); onClose();
@@ -1894,7 +2237,7 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
       </div>
       <div className="row2">
         <Field label="Role"><select value={f.role} onChange={set("role")}>
-          {[OWNER, "Legal Associate", "Engineer", "Drawings", "Executive", "Accounts", "Payments", "Admin"].map((r) => <option key={r}>{r}</option>)}
+          {[OWNER, "Legal Associate", "Engineer", "Drawings", "Executive", "Accounts", "Payments", "Admin", "Contractor"].map((r) => <option key={r}>{r}</option>)}
         </select></Field>
         <Field label="Department"><input value={f.dept} onChange={set("dept")} /></Field>
       </div>
@@ -1908,8 +2251,21 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
       </div>
       <div className="row2">
         <Field label="Leave balance (days)"><input type="number" value={f.leaveBalance} onChange={set("leaveBalance")} /></Field>
-        <Field label="Extra-hours incentive (₹/hour)"><input type="number" value={f.incentivePerHour} onChange={set("incentivePerHour")} /></Field>
+        <Field label="OT charges (₹ per hour)"><input type="number" value={f.incentivePerHour} onChange={set("incentivePerHour")} /></Field>
       </div>
+      <div className="row2">
+        <Field label="Salary start date"><input type="date" value={f.salaryStartDate || ""} onChange={set("salaryStartDate")} /></Field>
+        <Field label="Salary end date" hint="Leave blank while employed"><input type="date" value={f.salaryEndDate || ""} onChange={set("salaryEndDate")} /></Field>
+      </div>
+      <div className="row2">
+        <Field label="Firm / company (for contractors)"><input value={f.firm || ""} onChange={set("firm")} /></Field>
+        <Field label="Work type (for contractors)"><input value={f.workType || ""} onChange={set("workType")} placeholder="e.g. Electrical, Civil, Fabrication" /></Field>
+      </div>
+      <Field label="Weekly off day">
+        <select value={f.weeklyOff || "Sunday"} onChange={set("weeklyOff")}>
+          {["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((d0) => <option key={d0}>{d0}</option>)}
+        </select>
+      </Field>
       <div className="row2">
         <Field label="Salary" hint="Visible to the Owner only"><input value={f.salary} onChange={set("salary")} /></Field>
         <Field label="Salary type"><select value={f.salaryType} onChange={set("salaryType")}><option>Monthly</option><option>Daily</option><option>Contract</option></select></Field>
@@ -1949,7 +2305,7 @@ function AddUser({ db, user, commit, flash, onClose }) {
     <Modal title="Add a user" onClose={onClose}>
       <Field label="Full name"><input value={f.name} onChange={set("name")} /></Field>
       <Field label="Role"><select value={f.role} onChange={set("role")}>
-        {["Legal Associate", "Engineer", "Drawings", "Executive", "Accounts", "Payments", "Admin"].map((r) => <option key={r}>{r}</option>)}
+        {["Legal Associate", "Engineer", "Drawings", "Executive", "Accounts", "Payments", "Admin", "Contractor"].map((r) => <option key={r}>{r}</option>)}
       </select></Field>
       <Field label="Department"><input value={f.dept} onChange={set("dept")} /></Field>
       <Field label="Official email"><input value={f.email} onChange={set("email")} /></Field>
@@ -2012,6 +2368,905 @@ function Reports({ db, user }) {
         ))}
       </div>
     </Panel>
+  );
+}
+
+/* ============================ ACCOUNTS ============================ */
+function Accounts({ db, user, commit, flash }) {
+  const [tab, setTab] = useState("overview");
+  const tabs = [
+    ["overview", "Investor overview"], ["banks", "Bank accounts"], ["entry", "New entry"],
+    ["import", "Import bank statement"], ["entries", "Receipts & payments"], ["ledger", "Ledger statement"],
+  ];
+  return (
+    <>
+      <div className="statusbar" style={{ marginTop: 0 }}>
+        {tabs.map(([k, l]) => <button key={k} className={`chip${tab === k ? " on" : ""}`} onClick={() => setTab(k)}>{l}</button>)}
+      </div>
+      {tab === "overview" && <AcctOverview db={db} />}
+      {tab === "banks" && <BankAccounts db={db} user={user} commit={commit} flash={flash} />}
+      {tab === "entry" && <ManualEntry db={db} user={user} commit={commit} flash={flash} />}
+      {tab === "import" && <ImportStatement db={db} user={user} commit={commit} flash={flash} />}
+      {tab === "entries" && <EntriesTable db={db} user={user} commit={commit} flash={flash} />}
+      {tab === "ledger" && <LedgerStatement db={db} user={user} />}
+    </>
+  );
+}
+
+function AcctOverview({ db }) {
+  const accts = db.accounts || [], entries = db.entries || [];
+  const month = today().slice(0, 7);
+  const inMonth = entries.filter((e) => (e.date || "").slice(0, 7) === month);
+  const rec = inMonth.filter((e) => e.type === "Receipt").reduce((a, e) => a + e.amount, 0);
+  const pay = inMonth.filter((e) => e.type === "Payment").reduce((a, e) => a + e.amount, 0);
+  const totalBal = accts.reduce((a, x) => a + (Number(x.balance) || 0), 0);
+  const companies = [...new Set(accts.map((a) => a.company))];
+  return (
+    <>
+      <div className="grid-4">
+        <Stat n={inr(totalBal)} label="Total bank balance (as stated)" t="green" />
+        <Stat n={inr(rec)} label="Receipts this month" t="blue" />
+        <Stat n={inr(pay)} label="Payments this month" t="orange" />
+        <Stat n={inr(rec - pay)} label="Net this month" t={rec - pay >= 0 ? "green" : "red"} />
+      </div>
+      {accts.length === 0 ? <Panel title="Bank accounts"><Empty>No bank accounts recorded yet. The Payments head adds them under the Bank accounts tab.</Empty></Panel> :
+        companies.map((co) => (
+          <Panel key={co} title={co || "—"} sub={`${accts.filter((a) => a.company === co).length} account(s)`}>
+            <div className="scroll-x">
+              <table className="tbl">
+                <thead><tr><th>Account name</th><th>Bank</th><th>Branch</th><th>Account no.</th><th>IFSC / RTGS</th><th className="amt">Balance</th><th className="amt">Receipts (month)</th><th className="amt">Payments (month)</th></tr></thead>
+                <tbody>
+                  {accts.filter((a) => a.company === co).map((a) => {
+                    const em = inMonth.filter((e) => e.accountId === a.id);
+                    return (
+                      <tr key={a.id}>
+                        <td><b>{a.accountName}</b></td><td>{a.bankName}</td><td>{a.branch}</td>
+                        <td className="mono">{a.accountNo}</td><td className="mono">{a.ifsc}</td>
+                        <td className="amt"><b>{inr(a.balance)}</b></td>
+                        <td className="amt">{inr(em.filter((e) => e.type === "Receipt").reduce((x, e) => x + e.amount, 0))}</td>
+                        <td className="amt">{inr(em.filter((e) => e.type === "Payment").reduce((x, e) => x + e.amount, 0))}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+        ))}
+      <Panel title="Recent entries" sub="Latest 10 across all accounts">
+        {entries.length === 0 ? <Empty>No receipts or payments recorded yet.</Empty> : (
+          <table className="tbl">
+            <thead><tr><th>Date</th><th>Type</th><th>Particulars</th><th>Ledger</th><th className="amt">Amount</th></tr></thead>
+            <tbody>
+              {[...entries].sort((a, b) => (b.date || "").localeCompare(a.date || "")).slice(0, 10).map((e) => (
+                <tr key={e.id}>
+                  <td>{fmtDate(e.date)}</td>
+                  <td><Badge t={e.type === "Receipt" ? "green" : "orange"}>{e.type}</Badge></td>
+                  <td>{e.desc}</td><td>{e.ledger || <span className="muted">untagged</span>}</td>
+                  <td className="amt">{inr(e.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Panel>
+    </>
+  );
+}
+
+function BankAccounts({ db, user, commit, flash }) {
+  const accts = db.accounts || [];
+  const blank = { company: "", accountName: "", accountNo: "", bankName: "", branch: "", ifsc: "", balance: "" };
+  const [f, setF] = useState(null); // null = closed, {..., id?} = editing/adding
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = () => {
+    if (!f.company.trim() || !f.accountName.trim() || !f.bankName.trim()) return flash("Company, account name and bank name are required");
+    commit((d) => {
+      learn(d, "entities", f.company);
+      if (f.id) { const x = d.accounts.find((y) => y.id === f.id); Object.assign(x, f, { balance: parseAmt(f.balance) }); }
+      else d.accounts.push({ ...f, id: uid("ba"), balance: parseAmt(f.balance) });
+    }, { by: user.name, action: f.id ? "Bank account updated" : "Bank account added", detail: `${f.company} · ${f.accountName}` });
+    flash("Saved"); setF(null);
+  };
+  return (
+    <Panel title="Bank accounts" sub="Company, bank and balance details — updated by the Payments head"
+      right={<Btn kind="solid" onClick={() => setF({ ...blank })}>Add bank account</Btn>}>
+      {accts.length === 0 ? <Empty>No bank accounts yet.</Empty> : (
+        <div className="scroll-x">
+          <table className="tbl">
+            <thead><tr><th>Company</th><th>Account name</th><th>Bank</th><th>Branch</th><th>Account no.</th><th>IFSC / RTGS</th><th className="amt">Balance</th><th></th></tr></thead>
+            <tbody>{accts.map((a) => (
+              <tr key={a.id}>
+                <td>{a.company}</td><td><b>{a.accountName}</b></td><td>{a.bankName}</td><td>{a.branch}</td>
+                <td className="mono">{a.accountNo}</td><td className="mono">{a.ifsc}</td>
+                <td className="amt"><b>{inr(a.balance)}</b></td>
+                <td><Btn onClick={() => setF({ ...a, balance: String(a.balance) })}>Edit</Btn></td>
+              </tr>))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {f && (
+        <Modal title={f.id ? "Edit bank account" : "Add bank account"} onClose={() => setF(null)}>
+          <SmartSelect label="Company name" value={f.company} onChange={(v) => setF({ ...f, company: v })} options={db.masters.entities} />
+          <Field label="Bank account name"><input value={f.accountName} onChange={set("accountName")} placeholder="e.g. Revanza Estates — Current A/c" /></Field>
+          <div className="row2">
+            <Field label="Bank name"><input value={f.bankName} onChange={set("bankName")} /></Field>
+            <Field label="Branch name"><input value={f.branch} onChange={set("branch")} /></Field>
+          </div>
+          <div className="row2">
+            <Field label="Account number"><input value={f.accountNo} onChange={set("accountNo")} inputMode="numeric" /></Field>
+            <Field label="IFSC / RTGS code"><input value={f.ifsc} onChange={set("ifsc")} /></Field>
+          </div>
+          <Field label="Bank balance (₹)"><input value={f.balance} onChange={set("balance")} inputMode="decimal" /></Field>
+          <Btn kind="solid" full onClick={save}>Save</Btn>
+        </Modal>
+      )}
+    </Panel>
+  );
+}
+
+function ManualEntry({ db, user, commit, flash }) {
+  const accts = db.accounts || [];
+  const [f, setF] = useState({ accountId: "", date: today(), type: "Payment", amount: "", desc: "", ledger: "", category: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = () => {
+    if (!f.accountId) return flash("Choose a bank account");
+    const amt = parseAmt(f.amount);
+    if (!amt) return flash("Enter the amount");
+    if (!f.desc.trim()) return flash("Enter the particulars (who / what for)");
+    commit((d) => {
+      learn(d, "ledgers", f.ledger); learn(d, "categories", f.category);
+      d.entries.push({ id: uid("e"), accountId: f.accountId, date: f.date, type: f.type, amount: amt, desc: f.desc, ledger: f.ledger, category: f.category, source: "Manual", ref: "", ts: Date.now(), by: user.name });
+      pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id].filter((id) => id !== user.id),
+        `${user.name} recorded a ${f.type.toLowerCase()} of ${inr(amt)} — ${f.desc.slice(0, 60)}`, "Accounts", null);
+    }, { by: user.name, action: `${f.type} recorded`, detail: `${inr(amt)} · ${f.desc.slice(0, 40)}` });
+    flash(`${f.type} of ${inr(amt)} recorded`);
+    setF({ ...f, amount: "", desc: "" });
+  };
+  if (accts.length === 0) return <Panel title="New entry"><Empty>Add a bank account first, under the Bank accounts tab.</Empty></Panel>;
+  return (
+    <Panel title="Record a receipt or payment" sub="Manual entry — if the same transaction later arrives in a bank statement import, the statement is treated as accurate and this entry's ledger and category are carried onto it.">
+      <div className="row2">
+        <Field label="Bank account">
+          <select value={f.accountId} onChange={set("accountId")}>
+            <option value="">Select</option>
+            {accts.map((a) => <option key={a.id} value={a.id}>{a.company} — {a.accountName}</option>)}
+          </select>
+        </Field>
+        <Field label="Type"><select value={f.type} onChange={set("type")}><option>Payment</option><option>Receipt</option></select></Field>
+      </div>
+      <div className="row2">
+        <Field label="Date"><input type="date" value={f.date} onChange={set("date")} /></Field>
+        <Field label="Amount (₹)"><input value={f.amount} onChange={set("amount")} inputMode="decimal" /></Field>
+      </div>
+      <Field label="Particulars"><input value={f.desc} onChange={set("desc")} placeholder="Paid to / received from, and what for" /></Field>
+      <div className="row2">
+        <SmartSelect label="Ledger name" value={f.ledger} onChange={(v) => setF({ ...f, ledger: v })} options={db.masters.ledgers || []} hint="New entries under Others join the list." />
+        <SmartSelect label="Category" value={f.category} onChange={(v) => setF({ ...f, category: v })} options={db.masters.categories || []} />
+      </div>
+      <Btn kind="solid" full onClick={save}>Record entry</Btn>
+    </Panel>
+  );
+}
+
+function ImportStatement({ db, user, commit, flash }) {
+  const accts = db.accounts || [];
+  const [accountId, setAccountId] = useState("");
+  const [rows, setRows] = useState(null);
+  const [map, setMap] = useState({ date: -1, desc: -1, debit: -1, credit: -1, ref: -1 });
+  const fileRef = React.useRef(null);
+
+  const guess = (hdr) => {
+    const find = (re) => hdr.findIndex((h) => re.test(h));
+    return {
+      date: find(/date/i),
+      desc: find(/desc|narrat|particular|remark/i),
+      debit: find(/debit|withdraw|dr\b/i),
+      credit: find(/credit|deposit|cr\b/i),
+      ref: find(/ref|chq|cheque|utr|txn/i),
+    };
+  };
+  const onFile = (e) => {
+    const fl = e.target.files[0];
+    if (!fl) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      const r = parseCSV(String(rd.result));
+      if (r.length < 2) return flash("Could not read rows from this file — export the statement as CSV and try again");
+      setRows(r); setMap(guess(r[0].map((h) => String(h))));
+    };
+    rd.readAsText(fl);
+    e.target.value = "";
+  };
+
+  const parsed = useMemo(() => {
+    if (!rows || map.date < 0 || (map.debit < 0 && map.credit < 0)) return [];
+    const out = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      const date = parseBankDate(r[map.date]);
+      if (!date) continue;
+      const dr = map.debit >= 0 ? parseAmt(r[map.debit]) : 0;
+      const cr = map.credit >= 0 ? parseAmt(r[map.credit]) : 0;
+      if (!dr && !cr) continue;
+      out.push({
+        date, type: cr > 0 ? "Receipt" : "Payment", amount: cr > 0 ? cr : dr,
+        desc: map.desc >= 0 ? String(r[map.desc] || "").trim() : "",
+        ref: map.ref >= 0 ? String(r[map.ref] || "").trim() : "",
+      });
+    }
+    return out;
+  }, [rows, map]);
+
+  const doImport = () => {
+    if (!accountId) return flash("Choose which bank account this statement belongs to");
+    if (!parsed.length) return flash("No valid rows found — check the column mapping below");
+    let added = 0, merged = 0, skipped = 0;
+    commit((d) => {
+      parsed.forEach((p) => {
+        const dup = d.entries.find((x) => x.accountId === accountId && x.date === p.date && x.type === p.type && Math.abs(x.amount - p.amount) < 0.005);
+        if (dup) {
+          if (dup.source === "Manual") {
+            // statement is treated as accurate; the manual ledger/category tags are preserved
+            d.entries = d.entries.filter((x) => x.id !== dup.id);
+            d.entries.push({ id: uid("e"), accountId, ...p, ledger: dup.ledger, category: dup.category, source: "Statement", ts: Date.now(), by: user.name });
+            merged++;
+          } else skipped++;
+        } else {
+          d.entries.push({ id: uid("e"), accountId, ...p, ledger: "", category: "", source: "Statement", ts: Date.now(), by: user.name });
+          added++;
+        }
+      });
+      pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id].filter((id) => id !== user.id),
+        `${user.name} imported a bank statement: ${added} new, ${merged} matched with manual entries, ${skipped} already on record`, "Accounts", null);
+    }, { by: user.name, action: "Bank statement imported", detail: `${added} new · ${merged} merged · ${skipped} duplicates skipped` });
+    flash(`Imported: ${added} new, ${merged} merged with manual entries (their ledger/category kept), ${skipped} duplicates skipped`);
+    setRows(null);
+  };
+
+  const hdr = rows ? rows[0].map((h) => String(h)) : [];
+  const MapSel = ({ k, label }) => (
+    <Field label={label}>
+      <select value={map[k]} onChange={(e) => setMap({ ...map, [k]: Number(e.target.value) })}>
+        <option value={-1}>— not in this file —</option>
+        {hdr.map((h, i) => <option key={i} value={i}>{h || `Column ${i + 1}`}</option>)}
+      </select>
+    </Field>
+  );
+  return (
+    <Panel title="Import a bank statement" sub="CSV files only for now — in your netbanking, download the statement as CSV (or open the Excel file and Save As → CSV). Duplicates against manual entries are resolved automatically: the statement is kept as accurate and the manual entry's ledger and category are carried over.">
+      <Field label="Which bank account is this statement for?">
+        <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+          <option value="">Select</option>
+          {accts.map((a) => <option key={a.id} value={a.id}>{a.company} — {a.accountName} ({a.bankName})</option>)}
+        </select>
+      </Field>
+      <input ref={fileRef} type="file" accept=".csv,text/csv" style={{ display: "none" }} onChange={onFile} />
+      <Btn kind="solid" onClick={() => fileRef.current && fileRef.current.click()}>Choose CSV file</Btn>
+      {rows && (
+        <>
+          <h4>Match the columns</h4>
+          <p className="fhint">I've guessed from the headings — correct anything that's wrong. {parsed.length} valid transaction(s) detected.</p>
+          <div className="row2"><MapSel k="date" label="Date column" /><MapSel k="desc" label="Description / narration column" /></div>
+          <div className="row2"><MapSel k="debit" label="Debit / withdrawal column" /><MapSel k="credit" label="Credit / deposit column" /></div>
+          <MapSel k="ref" label="Reference / cheque / UTR column (optional)" />
+          {parsed.length > 0 && (
+            <>
+              <h4>Preview (first 8)</h4>
+              <table className="tbl">
+                <thead><tr><th>Date</th><th>Type</th><th>Particulars</th><th className="amt">Amount</th></tr></thead>
+                <tbody>{parsed.slice(0, 8).map((x, i) => (
+                  <tr key={i}><td>{fmtDate(x.date)}</td><td><Badge t={x.type === "Receipt" ? "green" : "orange"}>{x.type}</Badge></td><td>{x.desc.slice(0, 60)}</td><td className="amt">{inr(x.amount)}</td></tr>))}
+                </tbody>
+              </table>
+            </>
+          )}
+          <div style={{ marginTop: 14 }}>
+            <Btn kind="solid" full onClick={doImport}>Import {parsed.length} transaction(s)</Btn>
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function EntriesTable({ db, user, commit, flash }) {
+  const accts = db.accounts || [], entries = db.entries || [];
+  const [acc, setAcc] = useState(""); const [type, setType] = useState(""); const [q, setQ] = useState("");
+  const [from, setFrom] = useState(""); const [to, setTo] = useState("");
+  const [editId, setEditId] = useState(null);
+  const acctName = (id) => { const a = accts.find((x) => x.id === id); return a ? a.accountName : "—"; };
+  const rows = entries.filter((e) => {
+    if (acc && e.accountId !== acc) return false;
+    if (type && e.type !== type) return false;
+    if (from && e.date < from) return false;
+    if (to && e.date > to) return false;
+    if (q && !((e.desc || "") + (e.ledger || "") + (e.category || "") + (e.ref || "")).toLowerCase().includes(q.toLowerCase())) return false;
+    return true;
+  }).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const editing = entries.find((e) => e.id === editId);
+  const [tag, setTag] = useState({ ledger: "", category: "" });
+  const openEdit = (e) => { setEditId(e.id); setTag({ ledger: e.ledger || "", category: e.category || "" }); };
+  const saveTag = () => {
+    commit((d) => {
+      const x = d.entries.find((y) => y.id === editId);
+      x.ledger = tag.ledger; x.category = tag.category;
+      learn(d, "ledgers", tag.ledger); learn(d, "categories", tag.category);
+    }, { by: user.name, action: "Entry tagged", detail: editId });
+    setEditId(null); flash("Ledger and category saved");
+  };
+  const del = (e) => {
+    if (e.source !== "Manual") return flash("Statement entries are the bank's record and cannot be deleted here");
+    if (!window.confirm("Delete this manual entry?")) return;
+    commit((d) => { d.entries = d.entries.filter((x) => x.id !== e.id); }, { by: user.name, action: "Manual entry deleted", detail: `${e.type} ${inr(e.amount)} ${e.desc.slice(0, 30)}` });
+    flash("Entry deleted");
+  };
+  const untagged = entries.filter((e) => !e.ledger).length;
+  return (
+    <Panel title="Receipts and payments" sub={`${rows.length} entr${rows.length === 1 ? "y" : "ies"}${untagged ? ` · ${untagged} still need a ledger — tap Tag` : ""}`}>
+      <div className="filters">
+        <input placeholder="Search particulars, ledger, reference…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <select value={acc} onChange={(e) => setAcc(e.target.value)}><option value="">All accounts</option>{accts.map((a) => <option key={a.id} value={a.id}>{a.accountName}</option>)}</select>
+        <select value={type} onChange={(e) => setType(e.target.value)}><option value="">Both</option><option>Receipt</option><option>Payment</option></select>
+        <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+        <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+      </div>
+      {rows.length === 0 ? <Empty>No entries match. Record one under New entry, or import a bank statement.</Empty> : (
+        <div className="scroll-x">
+          <table className="tbl">
+            <thead><tr><th>Date</th><th>Account</th><th>Type</th><th>Particulars</th><th>Ledger</th><th>Category</th><th className="amt">Amount</th><th>Source</th><th></th></tr></thead>
+            <tbody>{rows.map((e) => (
+              <tr key={e.id}>
+                <td>{fmtDate(e.date)}</td><td>{acctName(e.accountId)}</td>
+                <td><Badge t={e.type === "Receipt" ? "green" : "orange"}>{e.type}</Badge></td>
+                <td>{e.desc}{e.ref && <i className="sub mono">{e.ref}</i>}</td>
+                <td>{e.ledger || <span className="muted">untagged</span>}</td>
+                <td>{e.category || <span className="muted">—</span>}</td>
+                <td className="amt"><b>{inr(e.amount)}</b></td>
+                <td><Badge t={e.source === "Statement" ? "blue" : "grey"}>{e.source}</Badge></td>
+                <td><Btn onClick={() => openEdit(e)}>Tag</Btn>{e.source === "Manual" && <Btn onClick={() => del(e)}>Delete</Btn>}</td>
+              </tr>))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {editing && (
+        <Modal title={`Tag entry — ${inr(editing.amount)} · ${fmtDate(editing.date)}`} onClose={() => setEditId(null)}>
+          <p className="desc">{editing.desc}</p>
+          <SmartSelect label="Ledger name" value={tag.ledger} onChange={(v) => setTag({ ...tag, ledger: v })} options={db.masters.ledgers || []} />
+          <SmartSelect label="Category" value={tag.category} onChange={(v) => setTag({ ...tag, category: v })} options={db.masters.categories || []} />
+          <Btn kind="solid" full onClick={saveTag}>Save</Btn>
+        </Modal>
+      )}
+    </Panel>
+  );
+}
+
+function LedgerStatement({ db, user }) {
+  const accts = db.accounts || [], entries = db.entries || [];
+  const [dim, setDim] = useState("ledger");
+  const [val, setVal] = useState("");
+  const [acc, setAcc] = useState("");
+  const [from, setFrom] = useState(""); const [to, setTo] = useState("");
+  const values = [...new Set(entries.map((e) => (dim === "ledger" ? e.ledger : e.category)).filter(Boolean))].sort();
+  const rows = entries.filter((e) => {
+    if (!val) return false;
+    if ((dim === "ledger" ? e.ledger : e.category) !== val) return false;
+    if (acc && e.accountId !== acc) return false;
+    if (from && e.date < from) return false;
+    if (to && e.date > to) return false;
+    return true;
+  }).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  let run = 0;
+  const lines = rows.map((e) => { run += e.type === "Receipt" ? e.amount : -e.amount; return { ...e, run }; });
+  const tRec = rows.filter((e) => e.type === "Receipt").reduce((a, e) => a + e.amount, 0);
+  const tPay = rows.filter((e) => e.type === "Payment").reduce((a, e) => a + e.amount, 0);
+  const acctName = (id) => { const a = accts.find((x) => x.id === id); return a ? a.accountName : "—"; };
+  const dl = () => downloadCSV(`ledger-${val}-${today()}.csv`,
+    [["Date", "Account", "Particulars", "Reference", "Receipt", "Payment", "Running balance"],
+    ...lines.map((e) => [e.date, acctName(e.accountId), e.desc, e.ref || "", e.type === "Receipt" ? e.amount : "", e.type === "Payment" ? e.amount : "", e.run]),
+    [], ["Totals", "", "", "", tRec, tPay, tRec - tPay]],
+    [`Revanza — Ledger statement: ${val} (${dim})`, `Generated ${new Date().toLocaleString("en-GB")} by ${user.name}`, "Confidential — internal circulation only"]);
+  return (
+    <Panel title="Ledger statement" sub="Pick a ledger or category to build its statement, with running balance and CSV download for Excel"
+      right={lines.length > 0 && <Btn kind="solid" onClick={dl}>Download CSV</Btn>}>
+      <div className="filters">
+        <select value={dim} onChange={(e) => { setDim(e.target.value); setVal(""); }}>
+          <option value="ledger">By ledger name</option><option value="category">By category</option>
+        </select>
+        <select value={val} onChange={(e) => setVal(e.target.value)}>
+          <option value="">Select {dim}</option>
+          {values.map((v) => <option key={v}>{v}</option>)}
+        </select>
+        <select value={acc} onChange={(e) => setAcc(e.target.value)}><option value="">All accounts</option>{accts.map((a) => <option key={a.id} value={a.id}>{a.accountName}</option>)}</select>
+        <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+        <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+      </div>
+      {!val ? <Empty>Choose a ledger or category above. Entries must be tagged (Receipts & payments tab → Tag) before they appear here.</Empty> :
+        lines.length === 0 ? <Empty>No tagged entries found for "{val}" in this range.</Empty> : (
+          <div className="scroll-x">
+            <table className="tbl">
+              <thead><tr><th>Date</th><th>Account</th><th>Particulars</th><th className="amt">Receipt</th><th className="amt">Payment</th><th className="amt">Running</th></tr></thead>
+              <tbody>
+                {lines.map((e) => (
+                  <tr key={e.id}>
+                    <td>{fmtDate(e.date)}</td><td>{acctName(e.accountId)}</td><td>{e.desc}</td>
+                    <td className="amt">{e.type === "Receipt" ? inr(e.amount) : ""}</td>
+                    <td className="amt">{e.type === "Payment" ? inr(e.amount) : ""}</td>
+                    <td className={`amt ${e.run < 0 ? "danger" : ""}`}>{inr(e.run)}</td>
+                  </tr>
+                ))}
+                <tr><td colSpan={3}><b>Totals</b></td><td className="amt"><b>{inr(tRec)}</b></td><td className="amt"><b>{inr(tPay)}</b></td><td className={`amt ${tRec - tPay < 0 ? "danger" : ""}`}><b>{inr(tRec - tPay)}</b></td></tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+    </Panel>
+  );
+}
+
+/* ============================ PROJECTS ============================ */
+const Prog = ({ pct }) => (
+  <span className="bar-t" style={{ display: "inline-block", width: 110, verticalAlign: "middle" }}>
+    <span className={`bar-f ${pct >= 100 ? "f-green" : pct > 0 ? "f-blue" : "f-grey"}`} style={{ width: Math.min(100, pct) + "%" }} />
+  </span>
+);
+
+function Projects({ db, user, commit, flash }) {
+  const canBuild = user.role === OWNER || user.role === "Engineer";
+  const [openP, setOpenP] = useState(null);
+  const [creating, setCreating] = useState(false);
+  const visible = (db.projects || []).filter((pj) =>
+    canBuild || (pj.team || []).includes(user.id) || (pj.contractors || []).includes(user.id));
+  const proj = (db.projects || []).find((pj) => pj.id === openP);
+  const pct = (pj) => {
+    const ts = (db.ptasks || []).filter((x) => x.projectId === pj.id);
+    return ts.length ? Math.round(ts.reduce((a, x) => a + (x.percent || 0), 0) / ts.length) : 0;
+  };
+  if (proj) return <ProjectDetail proj={proj} db={db} user={user} commit={commit} flash={flash} onBack={() => setOpenP(null)} canBuild={canBuild} />;
+  return (
+    <>
+      <Panel title="Projects" sub={user.role === "Contractor" ? "Your assigned project work" : "Layout and site execution projects"}
+        right={canBuild && <Btn kind="solid" onClick={() => setCreating(true)}>New project</Btn>}>
+        {visible.length === 0 ? <Empty>{canBuild ? "No projects yet — create the first one." : "No projects assigned to you yet."}</Empty> : (
+          <div className="scroll-x">
+            <table className="tbl">
+              <thead><tr><th>Project</th><th>Property / company</th><th>Dates</th><th>Team</th><th>Progress</th><th></th></tr></thead>
+              <tbody>{visible.map((pj) => {
+                const p0 = pct(pj);
+                const overdue = pj.end && pj.end < today() && p0 < 100;
+                return (
+                  <tr key={pj.id} className={overdue ? "row-danger" : ""}>
+                    <td><b>{pj.name}</b>{pj.desc && <i className="sub">{pj.desc.slice(0, 60)}</i>}</td>
+                    <td>{pj.entity}</td>
+                    <td>{fmtDate(pj.start)} → {fmtDate(pj.end)}{overdue && <i className="sub danger">past end date</i>}</td>
+                    <td>{(pj.team || []).length + (pj.contractors || []).length} people</td>
+                    <td><Prog pct={p0} /> <span className="mono">{p0}%</span></td>
+                    <td><Btn onClick={() => setOpenP(pj.id)}>Open</Btn></td>
+                  </tr>
+                );
+              })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+      {creating && <NewProject db={db} user={user} commit={commit} flash={flash} onClose={() => setCreating(false)} />}
+    </>
+  );
+}
+
+function PickPeople({ db, roles, picks, setPicks, label, hint }) {
+  const list = [...db.users].filter((u) => u.status === "Active" && roles.includes(u.role))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return (
+    <Field label={label} hint={hint}>
+      <div className="pick">
+        {list.length === 0 && <p className="fhint">No one with the right role yet — add them in Employee Directory.</p>}
+        {list.map((u) => (
+          <label key={u.id} className="check">
+            <input type="checkbox" checked={picks.includes(u.id)}
+              onChange={(e) => setPicks(e.target.checked ? [...picks, u.id] : picks.filter((x) => x !== u.id))} />
+            {u.name} — {u.role}{u.firm ? ` (${u.firm})` : ""}
+          </label>
+        ))}
+      </div>
+    </Field>
+  );
+}
+
+function NewProject({ db, user, commit, flash, onClose }) {
+  const [f, setF] = useState({ name: "", entity: "", desc: "", start: today(), end: addDays(today(), 60) });
+  const [team, setTeam] = useState([]);
+  const [contractors, setContractors] = useState([]);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = () => {
+    if (!f.name.trim() || !f.entity.trim()) return flash("Project name and property/company are required");
+    const id = uid("pj");
+    commit((d) => {
+      learn(d, "entities", f.entity);
+      d.projects.push({ id, ref: "PRJ-" + pad(d.projects.length + 1), ...f, team, contractors, createdBy: user.id, status: "In Progress", created: today() });
+      pushNotify(d, [...team, ...contractors].filter((x) => x !== user.id), `You have been added to project "${f.name}"`, "Project", null);
+    }, { by: user.name, action: "Project created", detail: f.name });
+    flash("Project created — now add its tasks"); onClose();
+  };
+  return (
+    <Modal title="New project" onClose={onClose} wide>
+      <Field label="Project name"><input value={f.name} onChange={set("name")} placeholder="e.g. Karinilam layout — infrastructure" /></Field>
+      <SmartSelect label="Property / company" value={f.entity} onChange={(v) => setF({ ...f, entity: v })} options={db.masters.entities} />
+      <Field label="Description (optional)"><textarea rows={2} value={f.desc} onChange={set("desc")} /></Field>
+      <div className="row2">
+        <Field label="Start date"><input type="date" value={f.start} onChange={set("start")} /></Field>
+        <Field label="Target end date"><input type="date" value={f.end} onChange={set("end")} /></Field>
+      </div>
+      <PickPeople db={db} roles={[OWNER, "Engineer", "Drawings", "Executive", "Admin", "Accounts", "Payments", "Legal Associate"]}
+        picks={team} setPicks={setTeam} label="Project team (staff and engineers)" />
+      <PickPeople db={db} roles={["Contractor"]} picks={contractors} setPicks={setContractors}
+        label="Contractors" hint="Contractors sign in like staff but can see only their project work. Add them first in Employee Directory with role Contractor." />
+      <Btn kind="solid" full onClick={save}>Create project</Btn>
+    </Modal>
+  );
+}
+
+function ProjectDetail({ proj, db, user, commit, flash, onBack, canBuild }) {
+  const isContractor = user.role === "Contractor";
+  const tasks = (db.ptasks || []).filter((x) => x.projectId === proj.id)
+    .filter((x) => !isContractor || (x.assignees || []).includes(user.id))
+    .sort((a, b) => (a.start || "").localeCompare(b.start || ""));
+  const [openT, setOpenT] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const cur = tasks.find((x) => x.id === openT);
+  const nameOf = (id) => uname(db, id) === "—" ? "Team" : uname(db, id);
+  const recalc = () => {
+    let n = 0;
+    commit((d) => { n = cascadeSchedule(d, proj.id, user.name); }, null);
+    flash(n ? `${n} task(s) rescheduled from linked delays — everyone connected has been notified` : "Schedule checked — nothing needs to move");
+  };
+  return (
+    <>
+      <Panel title={`${proj.ref} — ${proj.name}`} sub={`${proj.entity} · ${fmtDate(proj.start)} → ${fmtDate(proj.end)}`}
+        right={<><Btn onClick={onBack}>← All projects</Btn>{canBuild && <Btn onClick={recalc}>Recalculate schedule</Btn>}{canBuild && <Btn kind="solid" onClick={() => setAdding(true)}>Add task</Btn>}</>}>
+        {proj.desc && <p className="desc">{proj.desc}</p>}
+        <p className="fhint">Team: {(proj.team || []).map(nameOf).join(", ") || "—"} · Contractors: {(proj.contractors || []).map((id) => nameOf(id)).join(", ") || "—"}</p>
+        {tasks.length === 0 ? <Empty>{canBuild ? "No tasks yet. Add the first — e.g. Light poles, with subtasks like civil work, bolt fixing, erection, commissioning." : "No tasks assigned to you in this project yet."}</Empty> : (
+          <div className="scroll-x">
+            <table className="tbl">
+              <thead><tr><th>Task</th><th>Allocated to</th><th>Start</th><th>End</th><th>Linked to</th><th>Progress</th><th></th></tr></thead>
+              <tbody>{tasks.map((x) => {
+                const overdue = x.end < today() && (x.percent || 0) < 100;
+                return (
+                  <tr key={x.id} className={overdue ? "row-danger" : ""}>
+                    <td><b>{x.name}</b>{(x.subtasks || []).length > 0 && <i className="sub">{x.subtasks.filter((st) => st.done).length}/{x.subtasks.length} subtasks done</i>}</td>
+                    <td>{(x.assignees || []).map(nameOf).join(", ") || "—"}</td>
+                    <td>{fmtDate(x.start)}</td>
+                    <td>{fmtDate(x.end)}{x.origEnd && x.origEnd !== x.end && <i className="sub warn">was {fmtDate(x.origEnd)}</i>}{overdue && <i className="sub danger">overdue</i>}</td>
+                    <td>{(x.dependsOn || []).map((id) => (db.ptasks.find((y) => y.id === id) || {}).name).filter(Boolean).join(", ") || "—"}</td>
+                    <td><Prog pct={x.percent || 0} /> <span className="mono">{x.percent || 0}%</span></td>
+                    <td><Btn onClick={() => setOpenT(x.id)}>Open</Btn></td>
+                  </tr>
+                );
+              })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+      {cur && <PTaskModal task={cur} proj={proj} db={db} user={user} commit={commit} flash={flash} canBuild={canBuild} onClose={() => setOpenT(null)} />}
+      {adding && <NewPTask proj={proj} db={db} user={user} commit={commit} flash={flash} onClose={() => setAdding(false)} />}
+    </>
+  );
+}
+
+function NewPTask({ proj, db, user, commit, flash, onClose }) {
+  const [f, setF] = useState({ name: "", desc: "", start: today(), end: addDays(today(), 7) });
+  const [assignees, setAssignees] = useState([]);
+  const [deps, setDeps] = useState([]);
+  const [subs, setSubs] = useState([]);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const existing = (db.ptasks || []).filter((x) => x.projectId === proj.id);
+  const people = [...(proj.team || []), ...(proj.contractors || [])];
+  const save = () => {
+    if (!f.name.trim()) return flash("Task name is required");
+    const id = uid("pt");
+    commit((d) => {
+      d.ptasks.push({
+        id, projectId: proj.id, ...f, assignees, dependsOn: deps, percent: 0, status: "Not Started",
+        subtasks: subs.filter((x) => x.name.trim()).map((x) => ({ id: uid("ps"), name: x.name.trim(), start: x.start, end: x.end, percent: 0, done: false })),
+        updates: [], docs: [],
+      });
+      pushNotify(d, assignees.filter((x) => x !== user.id), `New project task for you in "${proj.name}": ${f.name}`, "Project task", null);
+      cascadeSchedule(d, proj.id, user.name);
+    }, { by: user.name, action: "Project task added", detail: `${proj.name} · ${f.name}` });
+    flash("Task added"); onClose();
+  };
+  return (
+    <Modal title={`Add task — ${proj.name}`} onClose={onClose} wide>
+      <Field label="Task name"><input value={f.name} onChange={set("name")} placeholder="e.g. Light poles" /></Field>
+      <Field label="Description (optional)"><textarea rows={2} value={f.desc} onChange={set("desc")} /></Field>
+      <div className="row2">
+        <Field label="Start date"><input type="date" value={f.start} onChange={set("start")} /></Field>
+        <Field label="End date"><input type="date" value={f.end} onChange={set("end")} /></Field>
+      </div>
+      <Field label="Allocated to" hint="Project team members and contractors">
+        <div className="pick">
+          {people.length === 0 && <p className="fhint">Add team members / contractors to the project first.</p>}
+          {people.map((id) => (
+            <label key={id} className="check">
+              <input type="checkbox" checked={assignees.includes(id)}
+                onChange={(e) => setAssignees(e.target.checked ? [...assignees, id] : assignees.filter((x) => x !== id))} />
+              {uname(db, id) === "—" ? "Team member" : uname(db, id)}
+            </label>
+          ))}
+        </div>
+      </Field>
+      {existing.length > 0 && (
+        <Field label="Linked to (depends on)" hint="If a linked task is delayed or incomplete, this task and its subtasks are pushed forward automatically and everyone is notified.">
+          <div className="pick">
+            {existing.map((x) => (
+              <label key={x.id} className="check">
+                <input type="checkbox" checked={deps.includes(x.id)}
+                  onChange={(e) => setDeps(e.target.checked ? [...deps, x.id] : deps.filter((y) => y !== x.id))} />
+                {x.name} (ends {fmtDate(x.end)})
+              </label>
+            ))}
+          </div>
+        </Field>
+      )}
+      <h4>Subtasks (e.g. civil work, bolt fixing, erection, commissioning)</h4>
+      {subs.map((x, i) => (
+        <div className="row2" key={i}>
+          <Field label={`Subtask ${i + 1}`}><input value={x.name} onChange={(e) => setSubs(subs.map((y, j) => j === i ? { ...y, name: e.target.value } : y))} /></Field>
+          <div className="row2">
+            <Field label="Start"><input type="date" value={x.start} onChange={(e) => setSubs(subs.map((y, j) => j === i ? { ...y, start: e.target.value } : y))} /></Field>
+            <Field label="End"><input type="date" value={x.end} onChange={(e) => setSubs(subs.map((y, j) => j === i ? { ...y, end: e.target.value } : y))} /></Field>
+          </div>
+        </div>
+      ))}
+      <div className="quick" style={{ marginBottom: 14 }}>
+        <Btn onClick={() => setSubs([...subs, { name: "", start: f.start, end: f.end }])}>Add a subtask</Btn>
+        {subs.length > 0 && <Btn onClick={() => setSubs(subs.slice(0, -1))}>Remove last</Btn>}
+      </div>
+      <Btn kind="solid" full onClick={save}>Add task</Btn>
+    </Modal>
+  );
+}
+
+function PTaskModal({ task, proj, db, user, commit, flash, canBuild, onClose }) {
+  const isAssignee = (task.assignees || []).includes(user.id);
+  const canUpdate = canBuild || isAssignee;
+  const [txt, setTxt] = useState("");
+  const [dates, setDates] = useState({ on: false, start: task.start, end: task.end });
+  const nameOf = (id) => uname(db, id) === "—" ? "Team" : uname(db, id);
+  const mutate = (fn, action, note = true) =>
+    commit((d) => {
+      const x = d.ptasks.find((y) => y.id === task.id);
+      fn(x, d);
+      cascadeSchedule(d, proj.id, user.name);
+    }, note ? { by: user.name, action, detail: `${proj.name} · ${task.name}` } : null);
+
+  const setPct = (v) => {
+    const pv = Math.max(0, Math.min(100, Number(v) || 0));
+    mutate((x, d) => {
+      x.percent = pv;
+      x.status = pv >= 100 ? "Completed" : pv > 0 ? "In Progress" : "Not Started";
+      pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id, ...(proj.team || []), ...(task.assignees || [])].filter((id) => id !== user.id),
+        `"${task.name}" in ${proj.name} is now ${pv}% (${user.name})`, "Project progress", null);
+    }, `Progress ${pv}%`);
+    flash(`Progress set to ${pv}%`);
+  };
+  const setSub = (sid, patch) => mutate((x) => {
+    const st = x.subtasks.find((y) => y.id === sid);
+    Object.assign(st, patch);
+    if (patch.done !== undefined) st.percent = patch.done ? 100 : st.percent;
+  }, "Subtask updated");
+  const addUpdate = (text) => {
+    if (!text.trim()) return;
+    mutate((x, d) => {
+      x.updates.unshift({ ts: Date.now(), by: user.name, text });
+      pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id, ...(proj.team || [])].filter((id) => id !== user.id),
+        `${user.name} on "${task.name}": ${text.slice(0, 80)}`, "Project update", null);
+    }, "Project task update");
+    flash("Update posted");
+  };
+  const addPhoto = async (img) => {
+    if (!img) return flash("The photo could not be read");
+    const g = await getGPS();
+    mutate((x) => x.docs.unshift({ ts: Date.now(), by: user.name, img, lat: g.lat, lng: g.lng }), "Site photo attached");
+    flash(g.lat != null ? "Photo attached with GPS, date and time" : "Photo attached — GPS unavailable");
+  };
+  const saveDates = () => {
+    mutate((x, d) => {
+      x.origEnd = x.origEnd || x.end;
+      x.start = dates.start; x.end = dates.end;
+      pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id, ...(proj.team || []), ...(task.assignees || [])].filter((id) => id !== user.id),
+        `Dates for "${task.name}" changed to ${fmtDate(dates.start)} → ${fmtDate(dates.end)} by ${user.name}`, "Project schedule", null);
+    }, "Task dates changed");
+    setDates({ ...dates, on: false }); flash("Dates saved — linked tasks rescheduled if needed");
+  };
+  const subAvg = (task.subtasks || []).length
+    ? Math.round(task.subtasks.reduce((a, x) => a + (x.percent || 0), 0) / task.subtasks.length) : null;
+
+  return (
+    <Modal title={task.name} onClose={onClose} wide>
+      <div className="kv">
+        <div><span>Project</span><b>{proj.name}</b></div>
+        <div><span>Allocated to</span><b>{(task.assignees || []).map(nameOf).join(", ") || "—"}</b></div>
+        <div><span>Dates</span><b>{fmtDate(task.start)} → {fmtDate(task.end)}{task.origEnd && task.origEnd !== task.end && <i className="sub warn">originally {fmtDate(task.origEnd)}</i>}</b></div>
+        <div><span>Linked to</span><b>{(task.dependsOn || []).map((id) => (db.ptasks.find((y) => y.id === id) || {}).name).filter(Boolean).join(", ") || "—"}</b></div>
+        <div><span>Status</span><b><Badge t={(task.percent || 0) >= 100 ? "green" : task.end < today() ? "red" : "blue"}>{(task.percent || 0) >= 100 ? "Completed" : task.end < today() ? "Overdue" : task.status || "In Progress"}</Badge></b></div>
+        <div><span>Progress</span><b>{task.percent || 0}%{subAvg != null && ` (subtasks average ${subAvg}%)`}</b></div>
+      </div>
+      {task.desc && <p className="desc">{task.desc}</p>}
+
+      {canUpdate && (
+        <>
+          <h4>Update completion</h4>
+          <div className="quick">
+            {[10, 25, 50, 75, 90, 100].map((v) => (
+              <button key={v} className={`chip${(task.percent || 0) === v ? " on" : ""}`} onClick={() => setPct(v)}>{v}%</button>
+            ))}
+            <input type="number" min={0} max={100} defaultValue={task.percent || 0} style={{ maxWidth: 90 }}
+              onKeyDown={(e) => e.key === "Enter" && setPct(e.target.value)} onBlur={(e) => Number(e.target.value) !== (task.percent || 0) && setPct(e.target.value)} />
+          </div>
+        </>
+      )}
+
+      {canBuild && (
+        <>
+          {!dates.on ? <div style={{ marginTop: 10 }}><Btn onClick={() => setDates({ ...dates, on: true })}>Change dates</Btn></div> : (
+            <div className="ext">
+              <div className="row2">
+                <Field label="Start"><input type="date" value={dates.start} onChange={(e) => setDates({ ...dates, start: e.target.value })} /></Field>
+                <Field label="End"><input type="date" value={dates.end} onChange={(e) => setDates({ ...dates, end: e.target.value })} /></Field>
+              </div>
+              <Btn kind="solid" onClick={saveDates}>Save dates</Btn>
+            </div>
+          )}
+        </>
+      )}
+
+      <h4>Subtasks</h4>
+      {(task.subtasks || []).length === 0 ? <Empty>No subtasks defined.</Empty> :
+        task.subtasks.map((st) => (
+          <div className="subt" key={st.id} style={{ gap: 10 }}>
+            <input type="checkbox" checked={!!st.done} disabled={!canUpdate} onChange={(e) => setSub(st.id, { done: e.target.checked })} />
+            <span className={st.done ? "struck" : ""} style={{ flex: 1 }}>{st.name}<i className="sub">{fmtDate(st.start)} → {fmtDate(st.end)}</i></span>
+            {canUpdate ? (
+              <input type="number" min={0} max={100} value={st.percent || 0} style={{ maxWidth: 70 }}
+                onChange={(e) => setSub(st.id, { percent: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })} />
+            ) : <span className="mono">{st.percent || 0}%</span>}
+            <span className="mono">%</span>
+          </div>
+        ))}
+
+      <h4>Site photos with GPS</h4>
+      {(task.docs || []).length === 0 ? <Empty>No photographs yet.</Empty> : (
+        <div className="thumbs">
+          {task.docs.map((x, i) => (
+            <figure key={i}>
+              <img src={x.img} alt={`By ${x.by}`} className="thumb-lg" />
+              <figcaption>{x.by} · {fmtStamp(x.ts)}<br />{x.lat != null ? `GPS ${x.lat.toFixed(4)}, ${x.lng.toFixed(4)}` : "GPS not captured"}</figcaption>
+            </figure>
+          ))}
+        </div>
+      )}
+      {canUpdate && <CameraButton label="Add site photo — GPS, date and time stamped" onShot={addPhoto} />}
+
+      <h4>Updates</h4>
+      {canUpdate && <>
+        <VoiceNote flash={flash} onText={(t) => addUpdate("Voice note (transcribed): " + t)} />
+        <div className="inline">
+          <textarea rows={2} placeholder="Progress, issues, material status…" value={txt} onChange={(e) => setTxt(e.target.value)} />
+          <Btn kind="solid" onClick={() => { addUpdate(txt); setTxt(""); }}>Post</Btn>
+        </div>
+      </>}
+      {(task.updates || []).length === 0 ? <Empty>No updates yet.</Empty> : (
+        <ul className="feed">{task.updates.map((u, i) => (
+          <li key={i}><span className="feed-m">{u.by} · {fmtStamp(u.ts)}</span>{u.text}</li>))}
+        </ul>
+      )}
+    </Modal>
+  );
+}
+
+/* ============================ SALARY ============================ */
+function Salary({ db, user, commit, flash }) {
+  const [ym, setYm] = useState(today().slice(0, 7));
+  const [openId, setOpenId] = useState(null);
+  const hr = { ...HR_DEFAULTS, ...(db.settings.hr || {}) };
+  const [pol, setPol] = useState(hr);
+  const staff = db.users.filter((u) => u.status === "Active" && u.role !== OWNER && u.role !== "Contractor");
+  const calcs = staff.map((u) => ({ u, c: calcSalary(db, u, ym) }));
+  const isCurrent = ym === today().slice(0, 7);
+  const savePol = () => {
+    commit((d) => {
+      d.settings.hr = {
+        latesPerHalfDay: Number(pol.latesPerHalfDay) || 3,
+        leaveUnpaid: !!pol.leaveUnpaid,
+        leaveExtraThreshold: Number(pol.leaveExtraThreshold) || 5,
+        leaveExtraDays: Number(pol.leaveExtraDays) || 2,
+      };
+    }, { by: user.name, action: "HR policy updated", detail: "" });
+    flash("Policy saved — all figures recalculated");
+  };
+  const dl = () => downloadCSV(`salary-${ym}.csv`,
+    [["Employee", "Role", "Monthly salary", "Days counted", "Present", "Absent", "Leave days", "Leave deducted (days)", "Lates", "Half-days from lates", "Off-days worked (+1 each)", "OT net (hours)", "OT pay", "Total deduction (days)", "Net payable"],
+    ...calcs.map(({ u, c }) => [u.name, u.role, u.salary || 0, c.upto ? c.upto - c.start + 1 : 0, c.present, c.absent, c.leaveDays, c.leaveDeduct, c.lates, c.halfDays, c.offWorked, (c.otNetMins / 60).toFixed(2), Math.round(c.otPay), c.dedDays, Math.round(c.net)])],
+    [`Revanza — Salary sheet ${ym}`, `Generated ${new Date().toLocaleString("en-GB")} by ${user.name}`, "Confidential — Owner only"]);
+  const cur = calcs.find((x) => x.u.id === openId);
+  return (
+    <>
+      <Panel title="HR policy" sub="These rules drive the calculation for every month. Change and save to recalculate.">
+        <div className="row2">
+          <Field label="Lates that make a half-day deduction"><input type="number" value={pol.latesPerHalfDay} onChange={(e) => setPol({ ...pol, latesPerHalfDay: e.target.value })} /></Field>
+          <Field label="Grace period" hint="Set per employee in the Directory. Minutes used within grace are not deducted from salary — they reduce OT minutes instead."><input readOnly value="Per employee (Directory → Manage)" /></Field>
+        </div>
+        <label className="check"><input type="checkbox" checked={!!pol.leaveUnpaid} onChange={(e) => setPol({ ...pol, leaveUnpaid: e.target.checked })} /> Approved leave is deducted from salary (loss of pay)</label>
+        <div className="row2">
+          <Field label="If leave in the month reaches (days)…"><input type="number" value={pol.leaveExtraThreshold} onChange={(e) => setPol({ ...pol, leaveExtraThreshold: e.target.value })} /></Field>
+          <Field label="…deduct this many extra days"><input type="number" value={pol.leaveExtraDays} onChange={(e) => setPol({ ...pol, leaveExtraDays: e.target.value })} /></Field>
+        </div>
+        <p className="fhint">Fixed rules: daily rate = monthly salary ÷ actual days in the month · absence without approved leave deducts a full day · a weekly-off day worked adds one full day (not 1.5) · OT is paid per minute after the person's work-end time at their OT rate, minus any grace minutes they used in the mornings.</p>
+        <Btn kind="solid" onClick={savePol}>Save policy</Btn>
+      </Panel>
+
+      <Panel title={`Salary sheet — ${ym}`} sub={isCurrent ? "Current month: calculated up to today; figures grow as the month runs." : "Full month."}
+        right={<><input type="month" value={ym} onChange={(e) => setYm(e.target.value)} /><Btn kind="solid" onClick={dl}>Download CSV</Btn></>}>
+        <div className="scroll-x">
+          <table className="tbl">
+            <thead><tr><th>Employee</th><th className="amt">Salary</th><th>Present</th><th>Absent</th><th>Leave</th><th>Lates</th><th>Off worked</th><th className="amt">OT (h)</th><th className="amt">OT pay</th><th className="amt">Deducted (days)</th><th className="amt">Net payable</th><th></th></tr></thead>
+            <tbody>
+              {calcs.map(({ u, c }) => (
+                <tr key={u.id}>
+                  <td><b>{u.name}</b><i className="sub">{u.role}</i></td>
+                  <td className="amt">{Number(u.salary) ? inr(u.salary) : <span className="muted">not set</span>}</td>
+                  <td>{c.present}</td>
+                  <td className={c.absent ? "danger" : ""}>{c.absent}</td>
+                  <td>{c.leaveDays}{c.leaveDeduct > c.leaveDays && <i className="sub danger">+{c.leaveDeduct - c.leaveDays} extra</i>}</td>
+                  <td>{c.lates}{c.halfDays > 0 && <i className="sub danger">−{c.halfDays} day</i>}</td>
+                  <td>{c.offWorked}</td>
+                  <td className="amt">{(c.otNetMins / 60).toFixed(1)}{c.graceEaten > 0 && <i className="sub">−{c.graceEaten}m grace</i>}</td>
+                  <td className="amt">{inr(Math.round(c.otPay))}</td>
+                  <td className="amt">{c.dedDays}</td>
+                  <td className="amt"><b>{Number(u.salary) ? inr(Math.round(c.net)) : "—"}</b></td>
+                  <td><Btn onClick={() => setOpenId(u.id)}>Details</Btn></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="fhint">Salaries, OT rates, salary start/end dates, work hours, grace minutes and the weekly off day are all set per employee in Employee Directory → Manage.</p>
+      </Panel>
+
+      {cur && (
+        <Modal title={`${cur.u.name} — ${ym}`} onClose={() => setOpenId(null)} wide>
+          <div className="kv">
+            <div><span>Monthly salary</span><b>{inr(cur.u.salary)}</b></div>
+            <div><span>Per-day rate (÷{cur.c.dim} days)</span><b>{inr(Math.round(cur.c.perDay))}</b></div>
+            <div><span>Base (days counted)</span><b>{inr(Math.round(cur.c.base))}</b></div>
+            <div><span>Deductions</span><b className={cur.c.dedDays ? "danger" : ""}>{cur.c.dedDays} day(s) = {inr(Math.round(cur.c.dedDays * cur.c.perDay))}</b></div>
+            <div><span>Off-days worked</span><b>+{inr(Math.round(cur.c.offWorked * cur.c.perDay))}</b></div>
+            <div><span>OT</span><b>{(cur.c.otNetMins / 60).toFixed(1)} h × {inr(cur.u.incentivePerHour)} = {inr(Math.round(cur.c.otPay))}</b></div>
+            <div><span>Net payable</span><b>{inr(Math.round(cur.c.net))}</b></div>
+          </div>
+          <h4>Day-by-day register</h4>
+          <div className="scroll-x">
+            <table className="tbl">
+              <thead><tr><th>Date</th><th>Status</th><th>In</th><th>Out</th><th className="amt">OT mins</th></tr></thead>
+              <tbody>{cur.c.days.map((d0) => (
+                <tr key={d0.date}>
+                  <td>{fmtDate(d0.date)}</td>
+                  <td className={d0.status === "Absent" ? "danger" : ""}>{d0.status}</td>
+                  <td>{d0.inT || "—"}</td><td>{d0.outT || "—"}</td>
+                  <td className="amt">{d0.ot || ""}</td>
+                </tr>))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+    </>
   );
 }
 
@@ -2248,6 +3503,11 @@ textarea{resize:vertical}
 .rep-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line2)}
 .rep-row:last-child{border-bottom:0}
 .danger-zone{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--line2)}
+
+.amt{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.pick{max-height:190px;overflow:auto;border:1px solid var(--line);border-radius:2px;padding:4px 12px;background:#fff}
+.pick .check{margin-bottom:0;border-bottom:1px solid var(--line2);padding:7px 0}
+.pick .check:last-child{border-bottom:0}
 
 /* photos + voice */
 .thumb{width:36px;height:36px;object-fit:cover;border-radius:2px;border:1px solid var(--line);display:block}

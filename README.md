@@ -90,3 +90,28 @@ Attendance requires a photograph and reads GPS. Browsers only allow camera/locat
 ## Replace the logo
 
 Put your logo file in `public/` (e.g. `public/logo.png`) and it will be available at `/logo.png`. Then update the `Mark` component in `src/App.jsx` (or ask Claude to wire it in) and swap `public/icon.svg` for the app icon.
+
+## Applying update 2 (group tasks, chat, notifications, legal form changes)
+
+If your Supabase database was created with the original `schema.sql`:
+1. Push this new code to GitHub (Vercel redeploys automatically).
+2. In Supabase → SQL Editor → paste the whole of `supabase/migration-2.sql` → Run (safe to run once; running twice is harmless).
+
+New in this version: tasks can be allocated to several staff at once (a group task counts as completed only when every member confirms, and everyone connected shares a chat inside the task); the Owner dashboard has a Staff Overview — tap any name for that person's full task list and report; adding a legal case now starts with the title, supports additional petitioners/respondents, has a self-learning Case Type dropdown, and no longer asks for risk level; and every user has a Notifications page (bell in the menu) fed by task assignments, status changes, chats, case updates and leave decisions.
+
+## Applying update 3 (Accounts module)
+
+1. Push this code to GitHub (Vercel redeploys).
+2. Supabase → SQL Editor → run the whole of `supabase/migration-3.sql` once.
+
+The Accounts menu appears only for the Owner and the Payments head. It contains: an Investor overview (balances per company, receipts/payments this month, recent entries); Bank accounts (company, account name/number, bank, branch, IFSC/RTGS, stated balance); manual Receipt/Payment entry with self-learning Ledger and Category dropdowns; CSV bank-statement import with automatic duplicate handling (the statement is treated as accurate; a matching manual entry is replaced but its ledger and category are carried onto the statement row); a Receipts & payments register with tagging; and Ledger statements by ledger or category with running balance and CSV download.
+
+## Applying update 4 (Salary module) — no database migration needed
+
+Just push the code; the new fields live inside existing tables. The Salary menu (Owner only) shows: an editable HR policy (lates-per-half-day, loss-of-pay leave with the extra-days rule), and a monthly salary sheet computed from attendance — daily rate = salary ÷ actual days in the month, absences deducted, every N lates = half day, grace minutes not deducted from salary but subtracted from OT, OT paid per minute after work-end at the person's OT rate, weekly-off days worked add one full day. Per-employee salary, OT rate, salary start/end dates, work hours, grace and weekly-off day are set in Employee Directory → Manage. Download the sheet as CSV; open any employee for the day-by-day register.
+
+## Applying update 5 (Projects module + contractors)
+
+1. Push the code (Vercel redeploys). 2. Run `supabase/migration-4.sql` once in the SQL Editor.
+
+Projects: created by MD and Engineers, each with a team of staff and a set of contractors. Contractors are added in Employee Directory with role "Contractor" (plus firm and work type), sign in exactly like staff, and see only their own project work — no attendance, tasks, directory or anything else, enforced by the database. Project tasks (e.g. Light poles) carry start/end dates, subtasks with their own dates (civil work, bolt fixing, erection, commissioning), percentage completion at both levels, GPS-stamped site photos, voice-note updates, and dependency links: when a linked task is delayed or incomplete, dependent tasks and their subtasks are pushed forward automatically, the original date stays visible, and MD, the project team and the assignees are all notified. A "Recalculate schedule" button re-runs the check any time.

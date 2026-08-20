@@ -5,8 +5,8 @@
    ============================================================ */
 import { createClient } from "@supabase/supabase-js";
 
-const url = "https://okwvvmohafnmgkmptigg.supabase.co";
-const anon = "sb_publishable_k-ZWRKnnKDWeqv3wEylV2g_GO9-8DFt";
+const url = import.meta.env.VITE_SUPABASE_URL;
+const anon = import.meta.env.VITE_SUPABASE_ANON_KEY;
 export const LIVE = Boolean(url && anon);
 export const supabase = LIVE ? createClient(url, anon) : null;
 
@@ -16,7 +16,7 @@ const OWNER = "Owner / Super Admin";
 /* Sign-in identity: Supabase auth accounts keyed on the mobile number.
    The fixed suffix only satisfies the minimum password length —
    the real secret is the user's PIN. Recommend 6-digit PINs later. */
-const emailFor = (mobile) => `${mobile}@revanza.in`;
+const emailFor = (mobile) => `${mobile}@rotm.revanza.app`;
 const pwFor = (pin) => `${pin}@Rvz#26`;
 
 export async function sbSession() {
@@ -53,10 +53,13 @@ export async function fetchAll() {
     if (mod) s = mod(s);
     return s.then((r) => r.data || []);
   };
-  const [pr, pay, tk, cs, at, lv, ms, lc, st, au] = await Promise.all([
+  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt] = await Promise.all([
     q("profiles"), q("payroll"), q("tasks"), q("cases"), q("attendance"), q("leaves"),
     q("masters"), q("locations"), q("app_settings"),
     q("audit", (s) => s.order("ts", { ascending: false }).limit(300)),
+    q("notifications", (s) => s.order("ts", { ascending: false }).limit(200)),
+    q("bank_accounts"), q("acct_entries"),
+    q("projects"), q("ptasks"),
   ]);
   const payMap = Object.fromEntries(pay.map((p) => [p.profile_id, p.data || {}]));
   const users = pr.map((r) => ({
@@ -81,6 +84,11 @@ export async function fetchAll() {
     locations: lc.map((r) => r.data),
     settings: (st[0] && st[0].data) || { morningDue: "10:30", ownerEmail: "md@revanza.in" },
     audit: au.map((r) => ({ ts: new Date(r.ts).getTime(), by: r.by_name, action: r.action, detail: r.detail })),
+    notifications: nf.map((r) => ({ id: r.id, userId: r.profile_id, ts: new Date(r.ts).getTime(), text: r.text, kind: r.kind, ref: r.ref, read: r.read })),
+    accounts: ba.map((r) => r.data),
+    entries: ae.map((r) => r.data),
+    projects: pj.map((r) => r.data),
+    ptasks: pt.map((r) => r.data),
   };
 }
 
@@ -94,10 +102,15 @@ const rowBuilders = {
     name: u.name, role: u.role, status: u.status,
     data: stripKeys(u, [...PROFILE_CORE, ...PAY_KEYS, "pin"]),
   }],
-  tasks: (t) => ["tasks", { id: t.id, assigned_to: t.assignedTo || null, assigned_by: t.assignedBy || null, status: t.status, data: t }],
+  tasks: (t) => ["tasks", { id: t.id, assigned_to: t.assignedTo || null, assigned_by: t.assignedBy || null, status: t.status, assignees: t.assignees || [], data: t }],
   cases: (c) => ["cases", { id: c.id, associate: c.associate || null, data: c }],
   attendance: (a) => ["attendance", { id: a.id, profile_id: a.userId, date: a.date, data: a }],
   leaves: (l) => ["leaves", { id: l.id, profile_id: l.userId, status: l.status, data: l }],
+  notifications: (n) => ["notifications", { id: n.id, profile_id: n.userId, text: n.text, kind: n.kind, ref: n.ref, read: n.read }],
+  accounts: (a) => ["bank_accounts", { id: a.id, data: a }],
+  entries: (e) => ["acct_entries", { id: e.id, account_id: e.accountId, data: e }],
+  projects: (p) => ["projects", { id: p.id, team: p.team || [], contractors: p.contractors || [], data: p }],
+  ptasks: (p) => ["ptasks", { id: p.id, project_id: p.projectId, assignees: p.assignees || [], data: p }],
   locations: (l) => ["locations", { id: l.id, data: l }],
 };
 
@@ -118,6 +131,14 @@ export async function syncDB(prev, next, meRole) {
             data: { salary: item.salary || "", salaryType: item.salaryType || "Monthly", incentivePerHour: item.incentivePerHour || 0 },
           }));
         }
+      }
+    }
+    // rows removed locally (e.g. dedup during statement import) are removed on the server too
+    const nextIds = new Set((next[col] || []).map((x) => x.id));
+    for (const x of prev[col] || []) {
+      if (!nextIds.has(x.id)) {
+        const [table] = rowBuilders[col](x);
+        jobs.push(supabase.from(table).delete().eq("id", x.id));
       }
     }
   }
