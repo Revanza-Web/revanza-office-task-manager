@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { LIVE, sbSession, sbSignIn, sbSignUp, sbChangePin, sbSignOut, fetchAll, syncDB } from "./lib/db.js";
+import * as XLSX from "xlsx";
+import * as XLSX from "xlsx";
 
 /* ============================================================
    REVANZA OFFICE TASK MANAGER — working prototype console
@@ -143,6 +145,45 @@ function parseBankDate(sv) {
   return null;
 }
 const parseAmt = (sv) => { const n = parseFloat(String(sv || "").replace(/[^0-9.\-]/g, "")); return isNaN(n) ? 0 : n; };
+const H = {
+  date: /(transaction\s*date|txn\s*date|^date\b|date\s*\()/i,
+  desc: /(particular|narrat|description|remark|detail)/i,
+  debit: /(withdraw|debit(?!\s*\/)|\bdr\b(?!\s*\/))/i,
+  credit: /(deposit|credit(?!\s*\/)|\bcr\b(?!\s*\/))/i,
+  amount: /^amount|amount\s*\(/i,
+  drcr: /(dr\s*\/\s*cr|debit\s*\/\s*credit)/i,
+  ref: /(ref|chq|cheque|utr)/i,
+  balance: /balance/i,
+};
+/* Indian bank statements bury the table under 10–20 rows of address
+   and header text. Find the row that actually names the columns. */
+function findHeaderRow(rows) {
+  let best = { idx: -1, score: 0 };
+  const lim = Math.min(rows.length, 45);
+  for (let i = 0; i < lim; i++) {
+    const cells = rows[i].map((c) => String(c || "").trim());
+    let score = 0;
+    if (cells.some((c) => H.date.test(c))) score += 2;
+    if (cells.some((c) => H.desc.test(c))) score += 1;
+    if (cells.some((c) => H.debit.test(c)) && cells.some((c) => H.credit.test(c))) score += 2;
+    if (cells.some((c) => H.amount.test(c)) && cells.some((c) => H.drcr.test(c))) score += 2;
+    if (cells.some((c) => H.balance.test(c))) score += 1;
+    if (score > best.score) best = { idx: i, score };
+  }
+  return best.score >= 3 ? best.idx : rows.length > 0 ? 0 : -1;
+}
+function guessColumns(hdr) {
+  const find = (re, after = -1) => hdr.findIndex((h, i) => i > after && re.test(String(h || "")));
+  const amount = find(H.amount);
+  return {
+    date: find(H.date), desc: find(H.desc),
+    debit: find(H.debit), credit: find(H.credit),
+    amount, drcr: find(H.drcr, amount), // Kotak has a second Dr/Cr for balance — take the one after Amount
+    ref: find(H.ref), balance: find(H.balance),
+  };
+}
+const cleanMobile = (v) => String(v || "").replace(/[^0-9]/g, "").slice(-10);
+const parseDrCr = (sv) => /d\s*r/i.test(String(sv || "")) ? "Payment" : /c\s*r/i.test(String(sv || "")) ? "Receipt" : null;
 
 /* ---------- salary engine ---------- */
 const HR_DEFAULTS = { latesPerHalfDay: 3, leaveUnpaid: true, leaveExtraThreshold: 5, leaveExtraDays: 2 };
@@ -389,6 +430,7 @@ function seedDB() {
     entries: [],
     projects: [],
     ptasks: [],
+    companies: [],
     audit: [{ ts: Date.now(), by: "system", action: "Workspace created", detail: "Seed users and sample records loaded" }],
     settings: { morningDue: "10:30", ownerEmail: "md@revanza.in" },
   };
@@ -2204,10 +2246,14 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
   const [f, setF] = useState({ ...u });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = () => {
+    const raw = String(f.mobile || "").trim();
+    const mob = cleanMobile(raw);
+    if (raw && raw !== "Pending Information" && mob.length !== 10)
+      return flash("The mobile number must contain exactly 10 digits — remove +91, spaces or dashes");
     commit((d) => {
       const x = d.users.find((y) => y.id === u.id);
       Object.assign(x, {
-        mobile: f.mobile, altMobile: f.altMobile, email: f.email, role: f.role, dept: f.dept,
+        mobile: mob.length === 10 ? mob : "Pending Information", altMobile: f.altMobile, email: f.email, role: f.role, dept: f.dept,
         designation: f.designation, workStart: f.workStart, workEnd: f.workEnd,
         graceMins: Number(f.graceMins), radiusM: Number(f.radiusM), leaveBalance: Number(f.leaveBalance),
         salary: f.salary, salaryType: f.salaryType, incentivePerHour: Number(f.incentivePerHour),
@@ -2292,12 +2338,15 @@ function AddUser({ db, user, commit, flash, onClose }) {
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = () => {
     if (!f.name.trim()) return flash("A name is required");
-    if (f.mobile && db.users.some((u) => u.mobile === f.mobile)) return flash("That mobile number is already registered");
+    const mob = cleanMobile(f.mobile);
+    if (String(f.mobile || "").trim() && mob.length !== 10)
+      return flash("The mobile number must contain exactly 10 digits — remove +91, spaces or dashes");
+    if (mob && db.users.some((u) => cleanMobile(u.mobile) === mob)) return flash("That mobile number is already registered to someone else");
     const empCode = "EMP" + pad(db.users.length + 1);
     const id = LIVE ? crypto.randomUUID() : empCode;
     commit((d) => d.users.push({
       id, empCode, name: f.name, role: f.role, dept: f.dept || "—", designation: f.role,
-      email: f.email || PENDING, mobile: f.mobile || PENDING, altMobile: PENDING, manager: "Sushil",
+      email: f.email || PENDING, mobile: mob.length === 10 ? mob : PENDING, altMobile: PENDING, manager: "Sushil",
       doj: today(), status: "Active", pin: "1234", mustChangePin: true, failed: 0, locked: false, logins: [],
       workStart: "09:30", workEnd: "18:30", graceMins: 15, weeklyOff: "Sunday", locationId: "LOC1",
       radiusM: 250, salary: "", salaryType: "Monthly", incentivePerHour: 0, leaveBalance: 12,
@@ -2378,8 +2427,8 @@ function Reports({ db, user }) {
 function Accounts({ db, user, commit, flash }) {
   const [tab, setTab] = useState("overview");
   const tabs = [
-    ["overview", "Investor overview"], ["banks", "Bank accounts"], ["entry", "New entry"],
-    ["import", "Import bank statement"], ["entries", "Receipts & payments"], ["ledger", "Ledger statement"],
+    ["overview", "Investor overview"], ["companies", "Companies"], ["banks", "Bank accounts"], ["statement", "Account statement"],
+    ["entry", "New entry"], ["import", "Import bank statement"], ["entries", "Receipts & payments"], ["ledger", "Ledger statement"],
   ];
   return (
     <>
@@ -2387,7 +2436,9 @@ function Accounts({ db, user, commit, flash }) {
         {tabs.map(([k, l]) => <button key={k} className={`chip${tab === k ? " on" : ""}`} onClick={() => setTab(k)}>{l}</button>)}
       </div>
       {tab === "overview" && <AcctOverview db={db} />}
+      {tab === "companies" && <Companies db={db} user={user} commit={commit} flash={flash} />}
       {tab === "banks" && <BankAccounts db={db} user={user} commit={commit} flash={flash} />}
+      {tab === "statement" && <AcctStatement db={db} user={user} />}
       {tab === "entry" && <ManualEntry db={db} user={user} commit={commit} flash={flash} />}
       {tab === "import" && <ImportStatement db={db} user={user} commit={commit} flash={flash} />}
       {tab === "entries" && <EntriesTable db={db} user={user} commit={commit} flash={flash} />}
@@ -2454,6 +2505,141 @@ function AcctOverview({ db }) {
         )}
       </Panel>
     </>
+  );
+}
+
+function Companies({ db, user, commit, flash }) {
+  const list = db.companies || [];
+  const accts = db.accounts || [];
+  const blank = { name: "", address: "", gst: "", pan: "", cin: "", contact: "", notes: "" };
+  const [f, setF] = useState(null);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = () => {
+    if (!f.name.trim()) return flash("Company name is required");
+    const dupe = list.some((c) => c.id !== f.id && c.name.toLowerCase() === f.name.trim().toLowerCase());
+    if (dupe) return flash("A company with this name already exists");
+    commit((d) => {
+      learn(d, "entities", f.name);
+      if (f.id) { const x = d.companies.find((y) => y.id === f.id); Object.assign(x, f, { name: f.name.trim() }); }
+      else d.companies.push({ ...f, id: uid("co"), name: f.name.trim() });
+    }, { by: user.name, action: f.id ? "Company updated" : "Company added", detail: f.name });
+    flash("Saved"); setF(null);
+  };
+  const del = (c) => {
+    if (accts.some((a) => a.company === c.name)) return flash("This company has bank accounts — move or delete those first");
+    if (!window.confirm(`Delete company "${c.name}"?`)) return;
+    commit((d) => { d.companies = d.companies.filter((x) => x.id !== c.id); },
+      { by: user.name, action: "Company deleted", detail: c.name });
+    flash("Company deleted");
+  };
+  return (
+    <Panel title="Companies" sub="Master list used across bank accounts and the investor overview — maintained by the Payments head and MD"
+      right={<Btn kind="solid" onClick={() => setF({ ...blank })}>Add company</Btn>}>
+      {list.length === 0 ? <Empty>No companies yet. Adding a bank account also creates its company here automatically.</Empty> : (
+        <div className="scroll-x">
+          <table className="tbl">
+            <thead><tr><th>Company</th><th>GST</th><th>PAN</th><th>CIN</th><th>Contact</th><th>Bank accounts</th><th></th></tr></thead>
+            <tbody>{[...list].sort((a, b) => a.name.localeCompare(b.name)).map((c) => (
+              <tr key={c.id}>
+                <td><b>{c.name}</b>{c.address && <i className="sub">{c.address.slice(0, 60)}</i>}</td>
+                <td className="mono">{c.gst || "—"}</td><td className="mono">{c.pan || "—"}</td><td className="mono">{c.cin || "—"}</td>
+                <td>{c.contact || "—"}</td>
+                <td>{accts.filter((a) => a.company === c.name).length}</td>
+                <td><Btn onClick={() => setF({ ...blank, ...c })}>Edit</Btn><Btn onClick={() => del(c)}>Delete</Btn></td>
+              </tr>))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {f && (
+        <Modal title={f.id ? "Edit company" : "Add company"} onClose={() => setF(null)}>
+          <Field label="Company name"><input value={f.name} onChange={set("name")} /></Field>
+          <Field label="Registered address"><textarea rows={2} value={f.address} onChange={set("address")} /></Field>
+          <div className="row2">
+            <Field label="GST number"><input value={f.gst} onChange={set("gst")} /></Field>
+            <Field label="PAN"><input value={f.pan} onChange={set("pan")} /></Field>
+          </div>
+          <div className="row2">
+            <Field label="CIN (if company)"><input value={f.cin} onChange={set("cin")} /></Field>
+            <Field label="Contact person / number"><input value={f.contact} onChange={set("contact")} /></Field>
+          </div>
+          <Field label="Notes"><textarea rows={2} value={f.notes} onChange={set("notes")} /></Field>
+          <Btn kind="solid" full onClick={save}>Save company</Btn>
+        </Modal>
+      )}
+    </Panel>
+  );
+}
+
+function AcctStatement({ db, user }) {
+  const accts = db.accounts || [], entries = db.entries || [];
+  const [sel, setSel] = useState(accts.map((a) => a.id));
+  const [from, setFrom] = useState(""); const [to, setTo] = useState("");
+  const toggle = (id) => setSel(sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]);
+  const rows = entries
+    .filter((e) => sel.includes(e.accountId))
+    .filter((e) => (!from || e.date >= from) && (!to || e.date <= to))
+    .sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.ts || 0) - (b.ts || 0));
+  let run = 0;
+  const lines = rows.map((e) => { run += e.type === "Receipt" ? e.amount : -e.amount; return { ...e, run }; });
+  const tRec = rows.filter((e) => e.type === "Receipt").reduce((a, e) => a + e.amount, 0);
+  const tPay = rows.filter((e) => e.type === "Payment").reduce((a, e) => a + e.amount, 0);
+  const acctName = (id) => { const a = accts.find((x) => x.id === id); return a ? a.accountName : "—"; };
+  const single = sel.length === 1 ? accts.find((a) => a.id === sel[0]) : null;
+  const dl = () => downloadCSV(`statement-${today()}.csv`,
+    [["Date", "Account", "Particulars", "Ledger", "Category", "Receipt", "Payment", "Running", "Source"],
+    ...lines.map((e) => [e.date, acctName(e.accountId), e.desc, e.ledger || "", e.category || "", e.type === "Receipt" ? e.amount : "", e.type === "Payment" ? e.amount : "", e.run, e.source]),
+    [], ["Totals", "", "", "", "", tRec, tPay, tRec - tPay, ""]],
+    [`Revanza — ${single ? `Statement: ${single.company} / ${single.accountName}` : `Combined statement (${sel.length} accounts)`}`,
+    `Generated ${new Date().toLocaleString("en-GB")} by ${user.name}`, "Confidential — internal circulation only"]);
+  return (
+    <Panel title={single ? `Statement — ${single.company} / ${single.accountName}` : `Combined statement — ${sel.length} of ${accts.length} accounts`}
+      sub="Tick one account for its individual statement, or several for a combined view. Running balance is the net of the entries shown (in-app records, not the bank's opening balance)."
+      right={lines.length > 0 && <Btn kind="solid" onClick={dl}>Download CSV</Btn>}>
+      <div className="quick" style={{ marginBottom: 12 }}>
+        {accts.map((a) => (
+          <button key={a.id} className={`chip${sel.includes(a.id) ? " on" : ""}`} onClick={() => toggle(a.id)}>{a.accountName}</button>
+        ))}
+        {accts.length > 1 && <>
+          <Btn onClick={() => setSel(accts.map((a) => a.id))}>All</Btn>
+          <Btn onClick={() => setSel([])}>None</Btn>
+        </>}
+      </div>
+      <div className="filters">
+        <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+        <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+      </div>
+      {single && (
+        <div className="kv" style={{ marginBottom: 6 }}>
+          <div><span>Bank</span><b>{single.bankName} · {single.branch}</b></div>
+          <div><span>Account no.</span><b className="mono">{single.accountNo}</b></div>
+          <div><span>IFSC / RTGS</span><b className="mono">{single.ifsc}</b></div>
+          <div><span>Stated balance</span><b>{inr(single.balance)}</b></div>
+        </div>
+      )}
+      {accts.length === 0 ? <Empty>Add bank accounts first.</Empty> :
+        lines.length === 0 ? <Empty>No entries for this selection and period.</Empty> : (
+          <div className="scroll-x">
+            <table className="tbl">
+              <thead><tr><th>Date</th>{!single && <th>Account</th>}<th>Particulars</th><th>Ledger</th><th className="amt">Receipt</th><th className="amt">Payment</th><th className="amt">{single ? "Bank balance / running" : "Running"}</th></tr></thead>
+              <tbody>
+                {lines.map((e) => (
+                  <tr key={e.id}>
+                    <td>{fmtDate(e.date)}</td>
+                    {!single && <td>{acctName(e.accountId)}</td>}
+                    <td>{e.desc}{e.ref && <i className="sub mono">{e.ref}</i>}</td>
+                    <td>{e.ledger || <span className="muted">—</span>}</td>
+                    <td className="amt">{e.type === "Receipt" ? inr(e.amount) : ""}</td>
+                    <td className="amt">{e.type === "Payment" ? inr(e.amount) : ""}</td>
+                    <td className={`amt ${e.run < 0 ? "danger" : ""}`}>{single && e.bal ? e.bal : inr(e.run)}</td>
+                  </tr>
+                ))}
+                <tr><td colSpan={single ? 3 : 4}><b>Totals</b></td><td className="amt"><b>{inr(tRec)}</b></td><td className="amt"><b>{inr(tPay)}</b></td><td className={`amt ${tRec - tPay < 0 ? "danger" : ""}`}><b>{inr(tRec - tPay)}</b></td></tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+    </Panel>
   );
 }
 
@@ -2557,61 +2743,79 @@ function ImportStatement({ db, user, commit, flash }) {
   const accts = db.accounts || [];
   const [accountId, setAccountId] = useState("");
   const [rows, setRows] = useState(null);
-  const [map, setMap] = useState({ date: -1, desc: -1, debit: -1, credit: -1, ref: -1 });
+  const [hdrIdx, setHdrIdx] = useState(0);
+  const [map, setMap] = useState({ date: -1, desc: -1, debit: -1, credit: -1, amount: -1, drcr: -1, ref: -1, balance: -1 });
+  const [fname, setFname] = useState("");
   const fileRef = React.useRef(null);
 
-  const guess = (hdr) => {
-    const find = (re) => hdr.findIndex((h) => re.test(h));
-    return {
-      date: find(/date/i),
-      desc: find(/desc|narrat|particular|remark/i),
-      debit: find(/debit|withdraw|dr\b/i),
-      credit: find(/credit|deposit|cr\b/i),
-      ref: find(/ref|chq|cheque|utr|txn/i),
-    };
+  const loadRows = (r, name) => {
+    const clean = r.filter((row) => row.some((c) => String(c || "").trim() !== ""));
+    if (clean.length < 2) return flash("Could not read a transaction table from this file");
+    const hi = findHeaderRow(clean);
+    setRows(clean); setHdrIdx(hi < 0 ? 0 : hi);
+    setMap(guessColumns((clean[hi < 0 ? 0 : hi] || []).map((c) => String(c || ""))));
+    setFname(name);
   };
   const onFile = (e) => {
     const fl = e.target.files[0];
     if (!fl) return;
+    const isExcel = /\.xlsx?$/i.test(fl.name);
     const rd = new FileReader();
     rd.onload = () => {
-      const r = parseCSV(String(rd.result));
-      if (r.length < 2) return flash("Could not read rows from this file — export the statement as CSV and try again");
-      setRows(r); setMap(guess(r[0].map((h) => String(h))));
+      try {
+        if (isExcel) {
+          const wb = XLSX.read(rd.result, { type: "array" });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          loadRows(XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" }).map((r) => r.map((c) => String(c ?? ""))), fl.name);
+        } else {
+          loadRows(parseCSV(String(rd.result)), fl.name);
+        }
+      } catch (err) { flash("Could not read this file: " + (err.message || "unknown error")); }
     };
-    rd.readAsText(fl);
+    if (isExcel) rd.readAsArrayBuffer(fl); else rd.readAsText(fl);
     e.target.value = "";
   };
 
   const parsed = useMemo(() => {
-    if (!rows || map.date < 0 || (map.debit < 0 && map.credit < 0)) return [];
+    if (!rows || map.date < 0) return [];
+    const useAmt = map.amount >= 0 && map.drcr >= 0;
+    if (!useAmt && map.debit < 0 && map.credit < 0) return [];
     const out = [];
-    for (let i = 1; i < rows.length; i++) {
+    for (let i = hdrIdx + 1; i < rows.length; i++) {
       const r = rows[i];
       const date = parseBankDate(r[map.date]);
       if (!date) continue;
-      const dr = map.debit >= 0 ? parseAmt(r[map.debit]) : 0;
-      const cr = map.credit >= 0 ? parseAmt(r[map.credit]) : 0;
-      if (!dr && !cr) continue;
+      let type = null, amount = 0;
+      if (useAmt) {
+        type = parseDrCr(r[map.drcr]);
+        amount = parseAmt(r[map.amount]);
+        if (!type || !amount) continue;
+      } else {
+        const dr = map.debit >= 0 ? parseAmt(r[map.debit]) : 0;
+        const cr = map.credit >= 0 ? parseAmt(r[map.credit]) : 0;
+        if (!dr && !cr) continue;
+        type = cr > 0 ? "Receipt" : "Payment";
+        amount = cr > 0 ? cr : dr;
+      }
       out.push({
-        date, type: cr > 0 ? "Receipt" : "Payment", amount: cr > 0 ? cr : dr,
+        date, type, amount,
         desc: map.desc >= 0 ? String(r[map.desc] || "").trim() : "",
         ref: map.ref >= 0 ? String(r[map.ref] || "").trim() : "",
+        bal: map.balance >= 0 ? String(r[map.balance] || "").trim() : "",
       });
     }
     return out;
-  }, [rows, map]);
+  }, [rows, map, hdrIdx]);
 
   const doImport = () => {
     if (!accountId) return flash("Choose which bank account this statement belongs to");
-    if (!parsed.length) return flash("No valid rows found — check the column mapping below");
+    if (!parsed.length) return flash("No valid rows found — check the column matching below");
     let added = 0, merged = 0, skipped = 0;
     commit((d) => {
       parsed.forEach((p) => {
         const dup = d.entries.find((x) => x.accountId === accountId && x.date === p.date && x.type === p.type && Math.abs(x.amount - p.amount) < 0.005);
         if (dup) {
           if (dup.source === "Manual") {
-            // statement is treated as accurate; the manual ledger/category tags are preserved
             d.entries = d.entries.filter((x) => x.id !== dup.id);
             d.entries.push({ id: uid("e"), accountId, ...p, ledger: dup.ledger, category: dup.category, source: "Statement", ts: Date.now(), by: user.name });
             merged++;
@@ -2622,38 +2826,40 @@ function ImportStatement({ db, user, commit, flash }) {
         }
       });
       pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id].filter((id) => id !== user.id),
-        `${user.name} imported a bank statement: ${added} new, ${merged} matched with manual entries, ${skipped} already on record`, "Accounts", null);
-    }, { by: user.name, action: "Bank statement imported", detail: `${added} new · ${merged} merged · ${skipped} duplicates skipped` });
+        `${user.name} imported ${fname || "a bank statement"}: ${added} new, ${merged} matched with manual entries, ${skipped} already on record`, "Accounts", null);
+    }, { by: user.name, action: "Bank statement imported", detail: `${fname} · ${added} new · ${merged} merged · ${skipped} duplicates` });
     flash(`Imported: ${added} new, ${merged} merged with manual entries (their ledger/category kept), ${skipped} duplicates skipped`);
-    setRows(null);
+    setRows(null); setFname("");
   };
 
-  const hdr = rows ? rows[0].map((h) => String(h)) : [];
+  const hdr = rows ? (rows[hdrIdx] || []).map((h) => String(h || "")) : [];
   const MapSel = ({ k, label }) => (
     <Field label={label}>
       <select value={map[k]} onChange={(e) => setMap({ ...map, [k]: Number(e.target.value) })}>
         <option value={-1}>— not in this file —</option>
-        {hdr.map((h, i) => <option key={i} value={i}>{h || `Column ${i + 1}`}</option>)}
+        {hdr.map((h, i) => <option key={i} value={i}>{h.trim() || `Column ${i + 1}`}</option>)}
       </select>
     </Field>
   );
   return (
-    <Panel title="Import a bank statement" sub="CSV files only for now — in your netbanking, download the statement as CSV (or open the Excel file and Save As → CSV). Duplicates against manual entries are resolved automatically: the statement is kept as accurate and the manual entry's ledger and category are carried over.">
+    <Panel title="Import a bank statement"
+      sub="Upload the file exactly as the bank gives it — CSV, XLS or XLSX all work (PNB, IOB, Axis, Kotak, Yes, IDFC First, SBI, ICICI, HDFC formats are recognised automatically). Duplicates against manual entries resolve automatically: the statement is kept as accurate and the manual entry's ledger and category are carried over.">
       <Field label="Which bank account is this statement for?">
         <select value={accountId} onChange={(e) => setAccountId(e.target.value)}>
           <option value="">Select</option>
           {accts.map((a) => <option key={a.id} value={a.id}>{a.company} — {a.accountName} ({a.bankName})</option>)}
         </select>
       </Field>
-      <input ref={fileRef} type="file" accept=".csv,text/csv" style={{ display: "none" }} onChange={onFile} />
-      <Btn kind="solid" onClick={() => fileRef.current && fileRef.current.click()}>Choose CSV file</Btn>
+      <input ref={fileRef} type="file" accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style={{ display: "none" }} onChange={onFile} />
+      <Btn kind="solid" onClick={() => fileRef.current && fileRef.current.click()}>Choose statement file (CSV / XLS / XLSX)</Btn>
       {rows && (
         <>
-          <h4>Match the columns</h4>
-          <p className="fhint">I've guessed from the headings — correct anything that's wrong. {parsed.length} valid transaction(s) detected.</p>
+          <h4>Column matching — {fname}</h4>
+          <p className="fhint">Table detected from row {hdrIdx + 1}. {parsed.length} valid transaction(s) found. Correct anything wrongly guessed; banks either give separate Withdrawal/Deposit columns, or one Amount column with a DR/CR flag — set whichever pair this file has.</p>
           <div className="row2"><MapSel k="date" label="Date column" /><MapSel k="desc" label="Description / narration column" /></div>
-          <div className="row2"><MapSel k="debit" label="Debit / withdrawal column" /><MapSel k="credit" label="Credit / deposit column" /></div>
-          <MapSel k="ref" label="Reference / cheque / UTR column (optional)" />
+          <div className="row2"><MapSel k="debit" label="Withdrawal / debit column" /><MapSel k="credit" label="Deposit / credit column" /></div>
+          <div className="row2"><MapSel k="amount" label="Amount column (single-amount banks)" /><MapSel k="drcr" label="DR / CR column (single-amount banks)" /></div>
+          <div className="row2"><MapSel k="ref" label="Reference / cheque / UTR (optional)" /><MapSel k="balance" label="Balance column (optional — shown in statement views)" /></div>
           {parsed.length > 0 && (
             <>
               <h4>Preview (first 8)</h4>
@@ -2691,6 +2897,13 @@ function EntriesTable({ db, user, commit, flash }) {
   const editing = entries.find((e) => e.id === editId);
   const [tag, setTag] = useState({ ledger: "", category: "" });
   const openEdit = (e) => { setEditId(e.id); setTag({ ledger: e.ledger || "", category: e.category || "" }); };
+  const quickTag = (e, field, v) => {
+    commit((d) => {
+      const x = d.entries.find((y) => y.id === e.id);
+      x[field] = v;
+      if (field === "ledger") learn(d, "ledgers", v); else learn(d, "categories", v);
+    }, { by: user.name, action: "Entry tagged", detail: `${field}: ${v}` });
+  };
   const saveTag = () => {
     commit((d) => {
       const x = d.entries.find((y) => y.id === editId);
@@ -2724,8 +2937,22 @@ function EntriesTable({ db, user, commit, flash }) {
                 <td>{fmtDate(e.date)}</td><td>{acctName(e.accountId)}</td>
                 <td><Badge t={e.type === "Receipt" ? "green" : "orange"}>{e.type}</Badge></td>
                 <td>{e.desc}{e.ref && <i className="sub mono">{e.ref}</i>}</td>
-                <td>{e.ledger || <span className="muted">untagged</span>}</td>
-                <td>{e.category || <span className="muted">—</span>}</td>
+                <td>
+                  <select className="cellsel" value={e.ledger || ""}
+                    onChange={(ev) => ev.target.value === "__other" ? openEdit(e) : quickTag(e, "ledger", ev.target.value)}>
+                    <option value="">—</option>
+                    {[...new Set([...(db.masters.ledgers || []), ...(e.ledger ? [e.ledger] : [])])].sort((a, b) => a.localeCompare(b)).map((o) => <option key={o}>{o}</option>)}
+                    <option value="__other">Others — add new…</option>
+                  </select>
+                </td>
+                <td>
+                  <select className="cellsel" value={e.category || ""}
+                    onChange={(ev) => ev.target.value === "__other" ? openEdit(e) : quickTag(e, "category", ev.target.value)}>
+                    <option value="">—</option>
+                    {[...new Set([...(db.masters.categories || []), ...(e.category ? [e.category] : [])])].sort((a, b) => a.localeCompare(b)).map((o) => <option key={o}>{o}</option>)}
+                    <option value="__other">Others — add new…</option>
+                  </select>
+                </td>
                 <td className="amt"><b>{inr(e.amount)}</b></td>
                 <td><Badge t={e.source === "Statement" ? "blue" : "grey"}>{e.source}</Badge></td>
                 <td><Btn onClick={() => openEdit(e)}>Tag</Btn>{e.source === "Manual" && <Btn onClick={() => del(e)}>Delete</Btn>}</td>
@@ -3508,6 +3735,7 @@ textarea{resize:vertical}
 .danger-zone{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--line2)}
 
 .amt{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.cellsel{min-width:130px;padding:5px 6px;font-size:12px}
 .pick{max-height:190px;overflow:auto;border:1px solid var(--line);border-radius:2px;padding:4px 12px;background:#fff}
 .pick .check{margin-bottom:0;border-bottom:1px solid var(--line2);padding:7px 0}
 .pick .check:last-child{border-bottom:0}
