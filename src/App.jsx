@@ -851,9 +851,11 @@ function LiveLogin({ onIn }) {
       const { error } = await sbSignUp(m, pin);
       if (error) {
         setBusy(false);
-        return setErr(/registered/i.test(error.message)
-          ? "This mobile number has not been added by the Owner yet."
-          : "Could not create the sign-in: " + error.message);
+        if (/already registered/i.test(error.message))
+          return setErr("This number already has a PIN — switch to the Sign in tab. Forgot it? Ask the Owner to reset.");
+        if (/not registered by the owner/i.test(error.message))
+          return setErr("This mobile number has not been added by the Owner yet.");
+        return setErr("Could not create the sign-in: " + error.message);
       }
       const r2 = await sbSignIn(m, pin);
       setBusy(false);
@@ -2346,7 +2348,7 @@ function AddUser({ db, user, commit, flash, onClose }) {
     commit((d) => d.users.push({
       id, empCode, name: f.name, role: f.role, dept: f.dept || "—", designation: f.role,
       email: f.email || PENDING, mobile: mob.length === 10 ? mob : PENDING, altMobile: PENDING, manager: "Sushil",
-      doj: today(), status: "Active", pin: "1234", mustChangePin: true, failed: 0, locked: false, logins: [],
+      doj: today(), status: "Active", pin: "1234", mustChangePin: !LIVE, failed: 0, locked: false, logins: [],
       workStart: "09:30", workEnd: "18:30", graceMins: 15, weeklyOff: "Sunday", locationId: "LOC1",
       radiusM: 250, salary: "", salaryType: "Monthly", incentivePerHour: 0, leaveBalance: 12,
     }), { by: user.name, action: "User added", detail: f.name });
