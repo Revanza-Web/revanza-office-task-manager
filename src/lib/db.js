@@ -5,8 +5,8 @@
    ============================================================ */
 import { createClient } from "@supabase/supabase-js";
 
-const url = import.meta.env.VITE_SUPABASE_URL;
-const anon = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const url = "https://okwvvmohafnmgkmptigg.supabase.co";
+const anon = "sb_publishable_k-ZWRKnnKDWeqv3wEylV2g_GO9-8DFt";
 export const LIVE = Boolean(url && anon);
 export const supabase = LIVE ? createClient(url, anon) : null;
 
@@ -16,7 +16,7 @@ const OWNER = "Owner / Super Admin";
 /* Sign-in identity: Supabase auth accounts keyed on the mobile number.
    The fixed suffix only satisfies the minimum password length —
    the real secret is the user's PIN. Recommend 6-digit PINs later. */
-const emailFor = (mobile) => `${mobile}@rotm.revanza.app`;
+const emailFor = (mobile) => `${mobile}@revanza.in`;
 const pwFor = (pin) => `${pin}@Rvz#26`;
 
 export async function sbSession() {
