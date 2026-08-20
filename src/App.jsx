@@ -1903,7 +1903,7 @@ function Cases({ db, user, commit, flash, preset, focus }) {
 
   return (
     <>
-      <Panel title="Legal cases" sub={`${rows.length} matter(s)`} right={isOwner && <Btn kind="solid" onClick={() => setCreating(true)}>Add case</Btn>}>
+      <Panel title="Legal cases" sub={`${rows.length} matter(s)`} right={(isOwner || user.role === "Legal Associate") && <Btn kind="solid" onClick={() => setCreating(true)}>Add case</Btn>}>
         <div className="filters">
           <input placeholder="Search case number, title, court…" value={q} onChange={(e) => setQ(e.target.value)} />
           <select value={stage} onChange={(e) => setStage(e.target.value)}><option value="">All stages</option>{CASE_STAGE.map((s) => <option key={s}>{s}</option>)}</select>
