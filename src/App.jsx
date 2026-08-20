@@ -666,6 +666,12 @@ export default function App() {
     return () => { clearInterval(iv); window.removeEventListener("focus", refresh); };
   }, [me]);
 
+  // contractors land on (and stay in) the Projects area
+  useEffect(() => {
+    const u = db && me ? db.users.find((x) => x.id === me) : null;
+    if (u && u.role === "Contractor" && !["projects", "notifications", "settings"].includes(view)) setView("projects");
+  }, [me, view, db]);
+
   const commit = useCallback((mut, note) => {
     setDb((prev) => {
       const next = JSON.parse(JSON.stringify(prev));
@@ -714,9 +720,6 @@ export default function App() {
   const myAlerts = isOwner ? alerts : alerts.filter((a) => a.who === user.name);
   const unreadNotifs = (db.notifications || []).filter((x) => x.userId === user.id && !x.read).length;
   const nav = NAV.filter((n) => allowed(n, user.role)).filter((n) => !isContractor || contractorViews.includes(n.id));
-  useEffect(() => {
-    if (user && user.role === "Contractor" && !["projects", "notifications", "settings"].includes(view)) setView("projects");
-  }, [me, view, user]);
 
   return (
     <>
