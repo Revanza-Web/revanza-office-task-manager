@@ -53,13 +53,13 @@ export async function fetchAll() {
     if (mod) s = mod(s);
     return s.then((r) => r.data || []);
   };
-  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt] = await Promise.all([
+  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt, co] = await Promise.all([
     q("profiles"), q("payroll"), q("tasks"), q("cases"), q("attendance"), q("leaves"),
     q("masters"), q("locations"), q("app_settings"),
     q("audit", (s) => s.order("ts", { ascending: false }).limit(300)),
     q("notifications", (s) => s.order("ts", { ascending: false }).limit(200)),
     q("bank_accounts"), q("acct_entries"),
-    q("projects"), q("ptasks"),
+    q("projects"), q("ptasks"), q("companies"),
   ]);
   const payMap = Object.fromEntries(pay.map((p) => [p.profile_id, p.data || {}]));
   const users = pr.map((r) => ({
@@ -89,6 +89,7 @@ export async function fetchAll() {
     entries: ae.map((r) => r.data),
     projects: pj.map((r) => r.data),
     ptasks: pt.map((r) => r.data),
+    companies: co.map((r) => r.data),
   };
 }
 
@@ -111,6 +112,7 @@ const rowBuilders = {
   entries: (e) => ["acct_entries", { id: e.id, account_id: e.accountId, data: e }],
   projects: (p) => ["projects", { id: p.id, team: p.team || [], contractors: p.contractors || [], data: p }],
   ptasks: (p) => ["ptasks", { id: p.id, project_id: p.projectId, assignees: p.assignees || [], data: p }],
+  companies: (c) => ["companies", { id: c.id, data: c }],
   locations: (l) => ["locations", { id: l.id, data: l }],
 };
 
