@@ -84,15 +84,21 @@ const learn = (d, key, v) => {
   const t = (v || "").trim();
   if (t && !d.masters[key].some((x) => x.toLowerCase() === t.toLowerCase())) d.masters[key].push(t);
 };
-const getGPS = () =>
-  new Promise((res) => {
-    if (!navigator.geolocation) return res({ lat: null, lng: null, err: "Geolocation unsupported" });
-    navigator.geolocation.getCurrentPosition(
-      (p) => res({ lat: p.coords.latitude, lng: p.coords.longitude, err: null }),
-      (e) => res({ lat: null, lng: null, err: e.message }),
-      { enableHighAccuracy: true, timeout: 8000 }
-    );
-  });
+const gpsOnce = (opts) => new Promise((res) => {
+  navigator.geolocation.getCurrentPosition(
+    (p) => res({ lat: p.coords.latitude, lng: p.coords.longitude, err: null }),
+    (e) => res({ lat: null, lng: null, err: e.message }),
+    opts
+  );
+});
+const getGPS = async () => {
+  if (!navigator.geolocation) return { lat: null, lng: null, err: "Location not supported on this device" };
+  let r = await gpsOnce({ enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 });
+  if (r.lat == null) r = await gpsOnce({ enableHighAccuracy: false, timeout: 15000, maximumAge: 120000 });
+  if (r.lat == null && /denied|permission/i.test(r.err || ""))
+    r.err = "Location is blocked for this site — tap the padlock in the address bar → Location → Allow, then retry";
+  return r;
+};
 function compressImage(file, maxW = 420, q = 0.6) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -194,10 +200,10 @@ function calcSalary(db, u, ym) {
   const dim = daysInMonth(ym);
   const t = today();
   const perDay = (Number(u.salary) || 0) / dim;
-  const start = u.salaryStartDate && u.salaryStartDate.slice(0, 7) === ym ? Number(u.salaryStartDate.slice(8, 10)) : 1;
-  const beforeStart = u.salaryStartDate && u.salaryStartDate.slice(0, 7) > ym;
-  const afterEnd = u.salaryEndDate && u.salaryEndDate.slice(0, 7) < ym;
-  const endCap = u.salaryEndDate && u.salaryEndDate.slice(0, 7) === ym ? Number(u.salaryEndDate.slice(8, 10)) : dim;
+  const start = Math.min(dim, Math.max(1, Number(u.salaryStartDay) || 1));
+  const beforeStart = false;
+  const afterEnd = false;
+  const endCap = Number(u.salaryEndDay) ? Math.min(dim, Math.max(1, Number(u.salaryEndDay))) : dim;
   const lastCounted = ym === t.slice(0, 7) ? Number(t.slice(8, 10)) : ym > t.slice(0, 7) ? 0 : dim;
   const upto = Math.min(endCap, lastCounted);
   const offDow = DOW[u.weeklyOff || "Sunday"] ?? 0;
@@ -209,7 +215,7 @@ function calcSalary(db, u, ym) {
       const dow = new Date(date + "T00:00:00").getDay();
       const a = db.attendance.find((x) => x.userId === u.id && x.date === date);
       const onLeave = db.leaves.some((l) => l.userId === u.id && l.status === "Approved" && l.from <= date && l.to >= date);
-      let status, otToday = 0;
+      let status, otToday = 0, lateBy = 0, graceToday = 0;
       if (dow === offDow) {
         if (a) { offWorked++; status = "Weekly off — worked (+1 day)"; } else status = "Weekly off";
       } else if (onLeave) { leaveDays++; status = "Approved leave"; }
@@ -217,11 +223,11 @@ function calcSalary(db, u, ym) {
       else {
         present++;
         const inM = minsSinceMidnight(a.inTs), ws = hhmmToMins(u.workStart || "09:30"), grace = Number(u.graceMins) || 0;
-        if (inM > ws + grace) { lates++; status = "Present — late"; }
-        else { status = "Present"; if (inM > ws) graceEaten += inM - ws; }
+        if (inM > ws + grace) { lates++; status = "Present — late"; lateBy = inM - ws; }
+        else { status = "Present"; if (inM > ws) { graceEaten += inM - ws; graceToday = inM - ws; } }
         if (a.outTs) { const om = minsSinceMidnight(a.outTs) - hhmmToMins(u.workEnd || "18:30"); if (om > 0) { otMins += om; otToday = om; } }
       }
-      days.push({ date, status, inT: a ? fmtTime(a.inTs) : "", outT: a && a.outTs ? fmtTime(a.outTs) : "", ot: otToday });
+      days.push({ date, status, inT: a ? fmtTime(a.inTs) : "", outT: a && a.outTs ? fmtTime(a.outTs) : "", ot: otToday, late: lateBy, graceUsed: graceToday });
     }
   }
   const halfDays = Math.floor(lates / (hr.latesPerHalfDay || 3)) * 0.5;
@@ -718,6 +724,13 @@ export default function App() {
       const next = JSON.parse(JSON.stringify(prev));
       mut(next);
       if (note) next.audit.unshift({ ts: Date.now(), by: note.by || "system", action: note.action, detail: note.detail || "" });
+      if (note && me && next.notifications) {
+        const actor = prev.users.find((x) => x.id === me);
+        const ownerId = prev.users.find((x) => x.role === OWNER)?.id;
+        if (actor && ownerId && actor.role !== OWNER) {
+          next.notifications.unshift({ id: uid("n"), userId: ownerId, ts: Date.now(), text: `${note.by || actor.name}: ${note.action}${note.detail ? " — " + note.detail : ""}`, kind: "Staff activity", ref: null, read: false });
+        }
+      }
       if (LIVE) {
         const meUser = me && prev.users.find((u) => u.id === me);
         syncDB(prev, next, meUser ? meUser.role : "");
@@ -1006,6 +1019,7 @@ function ChangePin({ user, commit, first, onDone, onClose }) {
 /* ============================ OWNER DASHBOARD ============================ */
 function OwnerDash({ db, alerts, go, commit, user, flash }) {
   const t = today();
+  const [emp, setEmp] = useState(null);
   const staff = db.users.filter((u) => u.status === "Active" && u.role !== OWNER && u.role !== "Contractor");
   const present = staff.filter((u) => attFor(db, u.id, t));
   const onLeave = staff.filter((u) => db.leaves.some((l) => l.userId === u.id && l.status === "Approved" && l.from <= t && l.to >= t));
@@ -1075,6 +1089,10 @@ function OwnerDash({ db, alerts, go, commit, user, flash }) {
         <Stat n={over.length} label="Overdue tasks" t="red" onClick={() => go("tasks", { quick: "overdue" })} />
         <Stat n={dueToday.length} label="Due today" t="yellow" onClick={() => go("tasks", { quick: "today" })} />
         <Stat n={delaying.length} label="Delaying completion" t="orange" onClick={() => go("tasks", { status: "Delaying Completion Date" })} />
+        <Stat n={db.tasks.length} label="Total tasks" t="grey" onClick={() => go("tasks", { status: "" })} />
+        <Stat n={db.tasks.filter((x) => x.status === "Completed").length} label="Completed tasks" t="green" onClick={() => go("tasks", { status: "Completed" })} />
+        <Stat n={db.tasks.filter((x) => x.status === "In Progress").length} label="In progress" t="blue" onClick={() => go("tasks", { status: "In Progress" })} />
+        <Stat n={db.tasks.filter((x) => x.status === "Stopped").length} label="Stopped tasks" t="red" onClick={() => go("tasks", { status: "Stopped" })} />
         <Stat n={db.cases.filter((c) => c.stage !== "Disposed").length} label="Active cases" t="blue" onClick={() => go("cases")} />
         <Stat n={listedToday.length} label="Listed today" t="red" onClick={() => go("cases", { quick: "today" })} />
         <Stat n={listedTom.length} label="Listed tomorrow" t="orange" onClick={() => go("cases", { quick: "tomorrow" })} />
@@ -1105,23 +1123,27 @@ function OwnerDash({ db, alerts, go, commit, user, flash }) {
 
       <Panel title="Staff overview" sub="Tap Open for that person's full task list and report" pad={false}>
         <ul className="board">
-          {staff.map((u) => {
+          {[...staff].sort((a, b) => a.role.localeCompare(b.role) || a.name.localeCompare(b.name)).map((u, i, arr) => {
             const uAll = db.tasks.filter((x) => taskAssignees(x).includes(u.id));
             const uOpen = uAll.filter((x) => x.status !== "Completed");
             const uOver = uAll.filter(isOverdue);
             const a = attFor(db, u.id, t);
+            const hdr = i === 0 || arr[i - 1].role !== u.role;
             return (
-              <li key={u.id} className={`board-row${uOver.length ? " r-orange" : ""}`}>
-                <div className="board-main">
-                  <span className="board-type">{u.role}</span>
-                  <span className="board-sub">{u.name}</span>
-                </div>
-                <div className="board-meta">
-                  <span className="board-who">{uOpen.length} open{uOver.length ? ` · ${uOver.length} overdue` : ""}</span>
-                  <span className="board-act">{a ? `In ${fmtTime(a.inTs)}` : "Not checked in"}</span>
-                </div>
-                <Btn onClick={() => go("tasks", { who: u.id })}>Open</Btn>
-              </li>
+              <React.Fragment key={u.id}>
+                {hdr && <li className="board-row grp-row">{u.role}</li>}
+                <li className={`board-row${uOver.length ? " r-orange" : ""}`} onClick={() => setEmp(u.id)} style={{ cursor: "pointer" }}>
+                  <div className="board-main">
+                    <span className="board-type">{a ? `In ${fmtTime(a.inTs)}` : "Not checked in"}</span>
+                    <span className="board-sub">{u.name}</span>
+                  </div>
+                  <div className="board-meta">
+                    <span className="board-who">{uOpen.length} open{uOver.length ? ` · ${uOver.length} overdue` : ""}</span>
+                    <span className="board-act">Tap for full report</span>
+                  </div>
+                  <Btn onClick={(e) => { e.stopPropagation(); setEmp(u.id); }}>Report</Btn>
+                </li>
+              </React.Fragment>
             );
           })}
         </ul>
@@ -1185,7 +1207,75 @@ function OwnerDash({ db, alerts, go, commit, user, flash }) {
         right={<Btn onClick={() => { navigator.clipboard?.writeText(summaryText()); flash("Summary copied"); }}>Copy</Btn>}>
         <pre className="summary">{summaryText()}</pre>
       </Panel>
+      {emp && <EmployeeReport db={db} u={db.users.find((x) => x.id === emp)} go={go} onClose={() => setEmp(null)} />}
     </>
+  );
+}
+
+function EmployeeReport({ db, u, go, onClose }) {
+  const ym = today().slice(0, 7);
+  const c = calcSalary(db, u, ym);
+  const uT = db.tasks.filter((x) => taskAssignees(x).includes(u.id));
+  const openT = uT.filter((x) => x.status !== "Completed").sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
+  const lv = db.leaves.filter((l) => l.userId === u.id).slice(0, 6);
+  const cs = db.cases.filter((x) => x.associate === u.id && x.stage !== "Disposed");
+  return (
+    <Modal title={`${u.name} — ${u.role}`} onClose={onClose} wide>
+      <div className="kv">
+        <div><span>Mobile</span><b>{u.mobile}</b></div>
+        <div><span>Email</span><b>{u.email}</b></div>
+        <div><span>This month</span><b>{c.present} present · {c.absent} absent · {c.leaveDays} leave · {c.lates} late</b></div>
+        <div><span>OT this month</span><b>{(c.otNetMins / 60).toFixed(1)} h</b></div>
+        <div><span>Open tasks</span><b>{openT.length} ({uT.filter(isOverdue).length} overdue)</b></div>
+        <div><span>Leave balance</span><b>{u.leaveBalance} day(s)</b></div>
+      </div>
+      <div className="quick" style={{ margin: "10px 0" }}>
+        <Btn kind="solid" onClick={() => { onClose(); go("tasks", { who: u.id }); }}>Open full task list</Btn>
+      </div>
+      <h4>Tasks and delays</h4>
+      {openT.length === 0 ? <Empty>No open tasks.</Empty> : (
+        <table className="tbl">
+          <thead><tr><th>Ref</th><th>Task</th><th>Due</th><th>Status</th><th>Delay</th></tr></thead>
+          <tbody>{openT.map((x) => (
+            <tr key={x.id} className={isOverdue(x) ? "row-danger" : ""}>
+              <td className="mono">{x.ref}</td><td>{x.name}</td><td>{fmtDate(x.due)}</td>
+              <td><Badge>{x.status}</Badge></td>
+              <td className={isOverdue(x) ? "danger" : ""}>{isOverdue(x) ? dayDiff(x.due, today()) + " day(s) overdue" : "—"}</td>
+            </tr>))}
+          </tbody>
+        </table>
+      )}
+      {cs.length > 0 && (<>
+        <h4>Active matters</h4>
+        <ul className="feed">{cs.map((x) => (
+          <li key={x.id}><span className="feed-m">{x.caseNo} · {x.stage}</span>{x.title} — next hearing {x.nextHearing ? fmtDate(x.nextHearing) : "not set"}</li>))}
+        </ul>
+      </>)}
+      <h4>Attendance — {ym} (day by day)</h4>
+      <div className="scroll-x">
+        <table className="tbl">
+          <thead><tr><th>Date</th><th>Status</th><th>In</th><th>Out</th><th>Late by</th><th className="amt">OT mins</th></tr></thead>
+          <tbody>{c.days.map((d0) => (
+            <tr key={d0.date}>
+              <td>{fmtDate(d0.date)}</td>
+              <td className={d0.status === "Absent" ? "danger" : ""}>{d0.status}</td>
+              <td>{d0.inT || "—"}</td><td>{d0.outT || "—"}</td>
+              <td className={d0.late ? "danger" : ""}>{d0.late ? d0.late + " min" : ""}</td>
+              <td className="amt">{d0.ot || ""}</td>
+            </tr>))}
+          </tbody>
+        </table>
+      </div>
+      {lv.length > 0 && (<>
+        <h4>Recent leave</h4>
+        <table className="tbl">
+          <thead><tr><th>Type</th><th>From</th><th>To</th><th>Status</th></tr></thead>
+          <tbody>{lv.map((l) => (
+            <tr key={l.id}><td>{l.type}</td><td>{fmtDate(l.from)}</td><td>{fmtDate(l.to)}</td><td><Badge>{l.status}</Badge></td></tr>))}
+          </tbody>
+        </table>
+      </>)}
+    </Modal>
   );
 }
 
@@ -1321,6 +1411,13 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
     return true;
   }).sort((a, b) => (a.due || "9999").localeCompare(b.due || "9999"));
 
+  const [group, setGroup] = useState("");
+  const groupKey = (x) => group === "staff" ? (taskAssignees(x).map((id) => uname(db, id)).join(", ") || "—")
+    : group === "status" ? x.status
+    : group === "date" ? (x.due ? fmtDate(x.due) : "No date")
+    : "";
+  const displayRows = group ? [...rows].sort((a, b) => groupKey(a).localeCompare(groupKey(b)) || (a.due || "9999").localeCompare(b.due || "9999")) : rows;
+
   const task = db.tasks.find((x) => x.id === open);
 
   return (
@@ -1343,6 +1440,10 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
             <option value="">Any due date</option><option value="overdue">Overdue</option>
             <option value="today">Due today</option><option value="week">Due this week</option>
           </select>
+          <select value={group} onChange={(e) => setGroup(e.target.value)}>
+            <option value="">No grouping</option><option value="staff">Group: staff-wise</option>
+            <option value="status">Group: status-wise</option><option value="date">Group: date-wise</option>
+          </select>
           {(q || status || who || quick) && <Btn onClick={() => { setQ(""); setStatus(""); setWho(""); setQuick(""); }}>Clear</Btn>}
         </div>
         {isOwner && who && (() => {
@@ -1364,10 +1465,14 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
             <table className="tbl">
               <thead><tr><th>Ref</th><th>Task</th><th>Property / company</th><th>Assigned to</th><th>Due</th><th>Status</th><th>Progress</th><th>Last update</th><th></th></tr></thead>
               <tbody>
-                {rows.map((x) => {
+                {displayRows.map((x, ri) => {
                   const done = x.subtasks.filter((s) => s.done).length;
+                  const gk = groupKey(x);
+                  const showHdr = group && (ri === 0 || groupKey(displayRows[ri - 1]) !== gk);
                   return (
-                    <tr key={x.id} className={isOverdue(x) ? "row-danger" : ""}>
+                    <React.Fragment key={x.id}>
+                    {showHdr && <tr className="grp"><td colSpan={9}>{gk}</td></tr>}
+                    <tr className={isOverdue(x) ? "row-danger" : ""}>
                       <td className="mono">{x.ref}</td>
                       <td><b>{x.name}</b>{x.extension?.status === "Pending" && <i className="sub warn">Extension requested → {fmtDate(x.extension.newDate)}</i>}</td>
                       <td>{x.entity}</td>
@@ -1381,6 +1486,7 @@ function Tasks({ db, user, commit, flash, preset, focus }) {
                       <td>{x.updates.length ? fmtStamp(x.updates[0].ts) : "No updates"}</td>
                       <td><Btn onClick={() => setOpen(x.id)}>Open</Btn></td>
                     </tr>
+                    </React.Fragment>
                   );
                 })}
               </tbody>
@@ -1612,6 +1718,18 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
           )}
         </>
       )}
+      {isOwner && (
+        <div className="danger-zone">
+          <Btn onClick={() => {
+            if (!window.confirm(`Delete ${task.ref} — ${task.name}? This removes it permanently for everyone.`)) return;
+            commit((d) => {
+              d.tasks = d.tasks.filter((x) => x.id !== task.id);
+              pushNotify(d, taskAssignees(task).filter((x) => x !== user.id), `${task.ref} — ${task.name} was deleted by ${user.name}`, "Task deleted", null);
+            }, { by: user.name, action: "Task deleted", detail: `${task.ref} ${task.name}` });
+            flash("Task deleted"); onClose();
+          }}>Delete this task</Btn>
+        </div>
+      )}
       {locked && <p className="notice">This task is completed and is now read-only for staff. Only the Owner can reopen it or change its status.</p>}
     </Modal>
   );
@@ -1716,12 +1834,13 @@ function Attendance({ db, user, commit, flash }) {
 
   return (
     <>
+      {!isOwner && (
       <Panel title="Mark attendance" sub={`Reporting location: ${loc.name} · permitted radius ${user.radiusM} m · photo with GPS, date and time is compulsory`}>
         {!me ? (
           <>
             <div className="quick">
               <CameraButton kind="solid" label={busy ? "Saving…" : "Check in — Office (take photo)"} disabled={busy} onShot={(img) => punch("in", "Office", img)} />
-              <CameraButton kind="brass" label="Check in — Site (take photo)" disabled={busy} onShot={(img) => punch("in", "Site", img)} />
+              <CameraButton kind="brass" label="Check in (out of office) — take photo" disabled={busy} onShot={(img) => punch("in", "Out of office", img)} />
             </div>
             <p className="notice">Tapping check-in opens the camera. The photo, your GPS position, and the date and time are all recorded automatically — attendance cannot be marked without the photograph.</p>
           </>
@@ -1744,6 +1863,7 @@ function Attendance({ db, user, commit, flash }) {
           </>
         )}
       </Panel>
+      )}
 
       {isOwner && (
         <Panel title="Attendance monitoring" sub={`${fmtDate(date)} · tap a photo to verify the face — a missing photo is flagged in alerts`}
@@ -1763,7 +1883,7 @@ function Attendance({ db, user, commit, flash }) {
                       <td>{fmtTime(a?.inTs)}</td>
                       <td>{a?.inPhoto ? <img src={a.inPhoto} className="thumb" alt={`${u.name} check-in`} /> : a ? <Badge t="red">Missing</Badge> : "—"}</td>
                       <td className={a && a.inDist > u.radiusM && a.mode === "Office" ? "danger" : ""}>
-                        {a?.inDist != null ? `${a.inDist} m` : a ? "Not captured" : "—"}{a?.mode === "Site" ? " (site)" : ""}
+                        {a?.inDist != null ? `${a.inDist} m` : a ? "Not captured" : "—"}{a?.mode && a.mode !== "Office" ? " (out of office)" : ""}
                       </td>
                       <td>{fmtTime(a?.outTs)}</td><td>{hours(a)}</td>
                       <td>{a?.morningUpdate ? <Badge t="green">Yes</Badge> : <Badge t="red">No</Badge>}</td>
@@ -1777,6 +1897,7 @@ function Attendance({ db, user, commit, flash }) {
         </Panel>
       )}
 
+      {!isOwner && (
       <Panel title="My recent attendance">
         {db.attendance.filter((a) => a.userId === user.id).length === 0 ? <Empty>No attendance recorded yet.</Empty> : (
           <table className="tbl">
@@ -1787,6 +1908,7 @@ function Attendance({ db, user, commit, flash }) {
           </table>
         )}
       </Panel>
+      )}
     </>
   );
 }
@@ -1889,7 +2011,8 @@ function Cases({ db, user, commit, flash, preset, focus }) {
   const [open, setOpen] = useState(focus?.kind === "case" ? focus.id : null);
   const [creating, setCreating] = useState(false);
 
-  let rows = isOwner ? db.cases : db.cases.filter((c) => c.associate === user.id);
+  const isLegal = user.role === "Legal Associate";
+  let rows = isOwner || isLegal ? db.cases : db.cases.filter((c) => c.associate === user.id);
   rows = rows.filter((c) => {
     if (stage && c.stage !== stage) return false;
     if (quick === "today" && c.nextHearing !== t) return false;
@@ -1903,7 +2026,7 @@ function Cases({ db, user, commit, flash, preset, focus }) {
 
   return (
     <>
-      <Panel title="Legal cases" sub={`${rows.length} matter(s)`} right={(isOwner || user.role === "Legal Associate") && <Btn kind="solid" onClick={() => setCreating(true)}>Add case</Btn>}>
+      <Panel title="Legal cases" sub={`${rows.length} matter(s)`} right={isOwner && <Btn kind="solid" onClick={() => setCreating(true)}>Add case</Btn>}>
         <div className="filters">
           <input placeholder="Search case number, title, court…" value={q} onChange={(e) => setQ(e.target.value)} />
           <select value={stage} onChange={(e) => setStage(e.target.value)}><option value="">All stages</option>{CASE_STAGE.map((s) => <option key={s}>{s}</option>)}</select>
@@ -2009,6 +2132,18 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
           <li key={i}><span className="feed-m">{u.by} · {fmtStamp(u.ts)} · {u.stage}{u.nextAction ? ` · ${u.nextAction}` : ""}</span>{u.text}
             {u.nextHearing && <i className="sub">Next hearing set to {fmtDate(u.nextHearing)}</i>}</li>))}
         </ul>
+      )}
+      {user.role === OWNER && (
+        <div className="danger-zone">
+          <Btn onClick={() => {
+            if (!window.confirm(`Delete case ${c.caseNo || c.title}? The entire record, updates and documents are removed permanently.`)) return;
+            commit((d) => {
+              d.cases = d.cases.filter((x) => x.id !== c.id);
+              pushNotify(d, [c.associate].filter((x) => x && x !== user.id), `Case ${c.caseNo || c.title} was deleted by ${user.name}`, "Case deleted", null);
+            }, { by: user.name, action: "Case deleted", detail: c.caseNo || c.title });
+            flash("Case deleted"); onClose();
+          }}>Delete this case</Btn>
+        </div>
       )}
     </Modal>
   );
@@ -2258,7 +2393,7 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
         designation: f.designation, workStart: f.workStart, workEnd: f.workEnd,
         graceMins: Number(f.graceMins), radiusM: Number(f.radiusM), leaveBalance: Number(f.leaveBalance),
         salary: f.salary, salaryType: f.salaryType, incentivePerHour: Number(f.incentivePerHour),
-        weeklyOff: f.weeklyOff || "Sunday", salaryStartDate: f.salaryStartDate || "", salaryEndDate: f.salaryEndDate || "",
+        weeklyOff: f.weeklyOff || "Sunday", salaryStartDay: Number(f.salaryStartDay) || "", salaryEndDay: Number(f.salaryEndDay) || "", name: (f.name || "").trim() || u.name,
         firm: f.firm || "", workType: f.workType || "",
       });
     }, { by: user.name, action: "User record updated", detail: u.name });
@@ -2277,6 +2412,7 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
   };
   return (
     <Modal title={`${u.name} — ${u.role}`} onClose={onClose} wide>
+      <Field label="Employee name"><input value={f.name} onChange={set("name")} /></Field>
       <div className="row2">
         <Field label="Mobile number" hint="This is the sign-in ID"><input value={f.mobile} onChange={set("mobile")} /></Field>
         <Field label="Alternate mobile"><input value={f.altMobile} onChange={set("altMobile")} /></Field>
@@ -2304,8 +2440,8 @@ function EditUser({ u, db, user, commit, flash, onClose }) {
         <Field label="OT charges (₹ per hour)"><input type="number" value={f.incentivePerHour} onChange={set("incentivePerHour")} /></Field>
       </div>
       <div className="row2">
-        <Field label="Salary start date"><input type="date" value={f.salaryStartDate || ""} onChange={set("salaryStartDate")} /></Field>
-        <Field label="Salary end date" hint="Leave blank while employed"><input type="date" value={f.salaryEndDate || ""} onChange={set("salaryEndDate")} /></Field>
+        <Field label="Salary start day (1–31)" hint="The day of every month the salary cycle starts — usually 1"><input type="number" min={1} max={31} value={f.salaryStartDay || ""} onChange={set("salaryStartDay")} /></Field>
+        <Field label="Salary end day (1–31)" hint="Blank = up to month end"><input type="number" min={1} max={31} value={f.salaryEndDay || ""} onChange={set("salaryEndDay")} /></Field>
       </div>
       <div className="row2">
         <Field label="Firm / company (for contractors)"><input value={f.firm || ""} onChange={set("firm")} /></Field>
@@ -2428,7 +2564,7 @@ function Reports({ db, user }) {
 function Accounts({ db, user, commit, flash }) {
   const [tab, setTab] = useState("overview");
   const tabs = [
-    ["overview", "Investor overview"], ["companies", "Companies"], ["banks", "Bank accounts"], ["statement", "Account statement"],
+    ["overview", "Investor overview"], ["banks", "Bank accounts"], ["statement", "Account statement"],
     ["entry", "New entry"], ["import", "Import bank statement"], ["entries", "Receipts & payments"], ["ledger", "Ledger statement"],
   ];
   return (
@@ -2437,7 +2573,6 @@ function Accounts({ db, user, commit, flash }) {
         {tabs.map(([k, l]) => <button key={k} className={`chip${tab === k ? " on" : ""}`} onClick={() => setTab(k)}>{l}</button>)}
       </div>
       {tab === "overview" && <AcctOverview db={db} />}
-      {tab === "companies" && <Companies db={db} user={user} commit={commit} flash={flash} />}
       {tab === "banks" && <BankAccounts db={db} user={user} commit={commit} flash={flash} />}
       {tab === "statement" && <AcctStatement db={db} user={user} />}
       {tab === "entry" && <ManualEntry db={db} user={user} commit={commit} flash={flash} />}
@@ -2454,12 +2589,15 @@ function AcctOverview({ db }) {
   const inMonth = entries.filter((e) => (e.date || "").slice(0, 7) === month);
   const rec = inMonth.filter((e) => e.type === "Receipt").reduce((a, e) => a + e.amount, 0);
   const pay = inMonth.filter((e) => e.type === "Payment").reduce((a, e) => a + e.amount, 0);
-  const totalBal = accts.reduce((a, x) => a + (Number(x.balance) || 0), 0);
+  const liveBal = (a) => (Number(a.balance) || 0)
+    + entries.filter((e) => e.accountId === a.id && e.type === "Receipt").reduce((x, e) => x + e.amount, 0)
+    - entries.filter((e) => e.accountId === a.id && e.type === "Payment").reduce((x, e) => x + e.amount, 0);
+  const totalBal = accts.reduce((a, x) => a + liveBal(x), 0);
   const companies = [...new Set(accts.map((a) => a.company))];
   return (
     <>
       <div className="grid-4">
-        <Stat n={inr(totalBal)} label="Total bank balance (as stated)" t="green" />
+        <Stat n={inr(totalBal)} label="Cumulative bank balance (all accounts)" t="green" />
         <Stat n={inr(rec)} label="Receipts this month" t="blue" />
         <Stat n={inr(pay)} label="Payments this month" t="orange" />
         <Stat n={inr(rec - pay)} label="Net this month" t={rec - pay >= 0 ? "green" : "red"} />
@@ -2469,7 +2607,7 @@ function AcctOverview({ db }) {
           <Panel key={co} title={co || "—"} sub={`${accts.filter((a) => a.company === co).length} account(s)`}>
             <div className="scroll-x">
               <table className="tbl">
-                <thead><tr><th>Account name</th><th>Bank</th><th>Branch</th><th>Account no.</th><th>IFSC / RTGS</th><th className="amt">Balance</th><th className="amt">Receipts (month)</th><th className="amt">Payments (month)</th></tr></thead>
+                <thead><tr><th>Account name</th><th>Bank</th><th>Branch</th><th>Account no.</th><th>IFSC / RTGS</th><th className="amt">Current balance</th><th className="amt">Receipts (month)</th><th className="amt">Payments (month)</th></tr></thead>
                 <tbody>
                   {accts.filter((a) => a.company === co).map((a) => {
                     const em = inMonth.filter((e) => e.accountId === a.id);
@@ -2477,12 +2615,15 @@ function AcctOverview({ db }) {
                       <tr key={a.id}>
                         <td><b>{a.accountName}</b></td><td>{a.bankName}</td><td>{a.branch}</td>
                         <td className="mono">{a.accountNo}</td><td className="mono">{a.ifsc}</td>
-                        <td className="amt"><b>{inr(a.balance)}</b></td>
+                        <td className="amt"><b>{inr(liveBal(a))}</b></td>
                         <td className="amt">{inr(em.filter((e) => e.type === "Receipt").reduce((x, e) => x + e.amount, 0))}</td>
                         <td className="amt">{inr(em.filter((e) => e.type === "Payment").reduce((x, e) => x + e.amount, 0))}</td>
                       </tr>
                     );
                   })}
+                  <tr><td colSpan={5}><b>Company total</b></td>
+                    <td className="amt"><b>{inr(accts.filter((a) => a.company === co).reduce((x, a) => x + liveBal(a), 0))}</b></td>
+                    <td colSpan={2}></td></tr>
                 </tbody>
               </table>
             </div>
@@ -2581,7 +2722,12 @@ function AcctStatement({ db, user }) {
     .filter((e) => sel.includes(e.accountId))
     .filter((e) => (!from || e.date >= from) && (!to || e.date <= to))
     .sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.ts || 0) - (b.ts || 0));
-  let run = 0;
+  // opening = the accounts' stated opening balances + every entry BEFORE the visible period,
+  // so the running column reconciles with the bank's own closing balance
+  const opening = accts.filter((a) => sel.includes(a.id)).reduce((x, a) => x + (Number(a.balance) || 0), 0)
+    + entries.filter((e) => sel.includes(e.accountId) && from && e.date < from)
+      .reduce((x, e) => x + (e.type === "Receipt" ? e.amount : -e.amount), 0);
+  let run = opening;
   const lines = rows.map((e) => { run += e.type === "Receipt" ? e.amount : -e.amount; return { ...e, run }; });
   const tRec = rows.filter((e) => e.type === "Receipt").reduce((a, e) => a + e.amount, 0);
   const tPay = rows.filter((e) => e.type === "Payment").reduce((a, e) => a + e.amount, 0);
@@ -2590,12 +2736,12 @@ function AcctStatement({ db, user }) {
   const dl = () => downloadCSV(`statement-${today()}.csv`,
     [["Date", "Account", "Particulars", "Ledger", "Category", "Receipt", "Payment", "Running", "Source"],
     ...lines.map((e) => [e.date, acctName(e.accountId), e.desc, e.ledger || "", e.category || "", e.type === "Receipt" ? e.amount : "", e.type === "Payment" ? e.amount : "", e.run, e.source]),
-    [], ["Totals", "", "", "", "", tRec, tPay, tRec - tPay, ""]],
+    [], ["Opening balance", "", "", "", "", "", "", opening, ""], ["Totals", "", "", "", "", tRec, tPay, "", ""], ["Closing balance", "", "", "", "", "", "", run, ""]],
     [`Revanza — ${single ? `Statement: ${single.company} / ${single.accountName}` : `Combined statement (${sel.length} accounts)`}`,
     `Generated ${new Date().toLocaleString("en-GB")} by ${user.name}`, "Confidential — internal circulation only"]);
   return (
     <Panel title={single ? `Statement — ${single.company} / ${single.accountName}` : `Combined statement — ${sel.length} of ${accts.length} accounts`}
-      sub="Tick one account for its individual statement, or several for a combined view. Running balance is the net of the entries shown (in-app records, not the bank's opening balance)."
+      sub="Tick one account for its individual statement, or several for a combined view. The balance column starts from the account's opening balance plus everything before the chosen period, so it reconciles with the bank's closing balance."
       right={lines.length > 0 && <Btn kind="solid" onClick={dl}>Download CSV</Btn>}>
       <div className="quick" style={{ marginBottom: 12 }}>
         {accts.map((a) => (
@@ -2615,7 +2761,9 @@ function AcctStatement({ db, user }) {
           <div><span>Bank</span><b>{single.bankName} · {single.branch}</b></div>
           <div><span>Account no.</span><b className="mono">{single.accountNo}</b></div>
           <div><span>IFSC / RTGS</span><b className="mono">{single.ifsc}</b></div>
-          <div><span>Stated balance</span><b>{inr(single.balance)}</b></div>
+          <div><span>Opening balance</span><b>{inr(single.balance)}</b></div>
+          <div><span>Closing balance (period)</span><b>{inr(run)}</b></div>
+          {single.lastStatementDate && <div><span>Bank's closing ({fmtDate(single.lastStatementDate)})</span><b>{inr(single.lastStatementClosing)}</b></div>}
         </div>
       )}
       {accts.length === 0 ? <Empty>Add bank accounts first.</Empty> :
@@ -2635,7 +2783,9 @@ function AcctStatement({ db, user }) {
                     <td className={`amt ${e.run < 0 ? "danger" : ""}`}>{single && e.bal ? e.bal : inr(e.run)}</td>
                   </tr>
                 ))}
-                <tr><td colSpan={single ? 3 : 4}><b>Totals</b></td><td className="amt"><b>{inr(tRec)}</b></td><td className="amt"><b>{inr(tPay)}</b></td><td className={`amt ${tRec - tPay < 0 ? "danger" : ""}`}><b>{inr(tRec - tPay)}</b></td></tr>
+                <tr><td colSpan={single ? 3 : 4}><b>Opening balance</b></td><td></td><td></td><td className="amt"><b>{inr(opening)}</b></td></tr>
+                <tr><td colSpan={single ? 3 : 4}><b>Totals for the period</b></td><td className="amt"><b>{inr(tRec)}</b></td><td className="amt"><b>{inr(tPay)}</b></td><td></td></tr>
+                <tr><td colSpan={single ? 3 : 4}><b>Closing balance</b></td><td></td><td></td><td className={`amt ${run < 0 ? "danger" : ""}`}><b>{inr(run)}</b></td></tr>
               </tbody>
             </table>
           </div>
@@ -2652,7 +2802,9 @@ function BankAccounts({ db, user, commit, flash }) {
   const save = () => {
     if (!f.company.trim() || !f.accountName.trim() || !f.bankName.trim()) return flash("Company, account name and bank name are required");
     commit((d) => {
-      learn(d, "entities", f.company);
+      const nm = f.company.trim();
+      if (nm && !(d.companies || []).some((c) => c.name.toLowerCase() === nm.toLowerCase()))
+        d.companies.push({ id: uid("co"), name: nm, gstin: "", cin: "", pan: "", address: "", notes: "" });
       if (f.id) { const x = d.accounts.find((y) => y.id === f.id); Object.assign(x, f, { balance: parseAmt(f.balance) }); }
       else d.accounts.push({ ...f, id: uid("ba"), balance: parseAmt(f.balance) });
     }, { by: user.name, action: f.id ? "Bank account updated" : "Bank account added", detail: `${f.company} · ${f.accountName}` });
@@ -2678,7 +2830,7 @@ function BankAccounts({ db, user, commit, flash }) {
       )}
       {f && (
         <Modal title={f.id ? "Edit bank account" : "Add bank account"} onClose={() => setF(null)}>
-          <SmartSelect label="Company name" value={f.company} onChange={(v) => setF({ ...f, company: v })} options={db.masters.entities} />
+          <SmartSelect label="Company name" value={f.company} onChange={(v) => setF({ ...f, company: v })} options={(db.companies || []).map((c) => c.name)} hint="This list is the Accounts company master — separate from the task/property dropdown. New names typed under Others join it automatically." />
           <Field label="Bank account name"><input value={f.accountName} onChange={set("accountName")} placeholder="e.g. Revanza Estates — Current A/c" /></Field>
           <div className="row2">
             <Field label="Bank name"><input value={f.bankName} onChange={set("bankName")} /></Field>
@@ -2747,6 +2899,8 @@ function ImportStatement({ db, user, commit, flash }) {
   const [hdrIdx, setHdrIdx] = useState(0);
   const [map, setMap] = useState({ date: -1, desc: -1, debit: -1, credit: -1, amount: -1, drcr: -1, ref: -1, balance: -1 });
   const [fname, setFname] = useState("");
+  const [det, setDet] = useState(null);
+  const [newAcc, setNewAcc] = useState({ company: "", accountName: "" });
   const fileRef = React.useRef(null);
 
   const loadRows = (r, name) => {
@@ -2756,6 +2910,33 @@ function ImportStatement({ db, user, commit, flash }) {
     setRows(clean); setHdrIdx(hi < 0 ? 0 : hi);
     setMap(guessColumns((clean[hi < 0 ? 0 : hi] || []).map((c) => String(c || ""))));
     setFname(name);
+    // scrape account details from the preamble above the transaction table
+    const pre = clean.slice(0, Math.max(1, (hi < 0 ? 0 : hi) + 1)).flat().map((c) => String(c || "")).join(" | ");
+    const g = (re) => { const m = pre.match(re); return m ? String(m[1]).trim() : ""; };
+    const bankM = name.match(/pnb|punjab|icici|hdfc|sbi|state bank|axis|kotak|idfc|iob|indian overseas|yes/i);
+    setDet({
+      accountNo: g(/account\s*(?:no|number)[^0-9]{0,12}(\d{9,18})/i) || g(/\bA\/?C\b[^0-9]{0,12}(\d{9,18})/i),
+      ifsc: g(/\b([A-Z]{4}0[A-Z0-9]{6})\b/),
+      branch: g(/branch(?:\s*name)?\s*[:\-]\s*([A-Za-z0-9 ,.\-()]{3,40})/i),
+      holder: g(/(?:account\s*name|customer\s*name)\s*[:\-]\s*([A-Za-z0-9 &.\-]{3,60})/i),
+      bank: bankM ? bankM[0].toUpperCase() : "",
+    });
+  };
+  const createFromStatement = () => {
+    if (!newAcc.company.trim()) return flash("Choose or type the company this account belongs to");
+    const id = uid("ba");
+    commit((d) => {
+      const nm = newAcc.company.trim();
+      if (!(d.companies || []).some((c) => c.name.toLowerCase() === nm.toLowerCase()))
+        d.companies.push({ id: uid("co"), name: nm, gstin: "", cin: "", pan: "", address: "", notes: "" });
+      d.accounts.push({
+        id, company: nm,
+        accountName: newAcc.accountName.trim() || det.holder || `${det.bank || "Bank"} account`,
+        accountNo: det.accountNo || "", bankName: det.bank || "", branch: det.branch || "", ifsc: det.ifsc || "", balance: 0,
+      });
+    }, { by: user.name, action: "Bank account auto-created from statement", detail: `${det.bank} ${det.accountNo || det.ifsc}` });
+    setAccountId(id);
+    flash("Bank account created from the statement's own details — verify under Bank accounts and set the balance");
   };
   const onFile = (e) => {
     const fl = e.target.files[0];
@@ -2811,6 +2992,17 @@ function ImportStatement({ db, user, commit, flash }) {
   const doImport = () => {
     if (!accountId) return flash("Choose which bank account this statement belongs to");
     if (!parsed.length) return flash("No valid rows found — check the column matching below");
+    // closing balance = the balance shown against the statement's last date
+    let closing = null, closingDate = null;
+    const withBal = parsed.filter((p) => p.bal);
+    if (withBal.length) {
+      const asc = parsed[0].date <= parsed[parsed.length - 1].date; // some banks list newest first
+      closingDate = withBal.reduce((m, p) => (p.date > m ? p.date : m), withBal[0].date);
+      const sameDay = withBal.filter((p) => p.date === closingDate);
+      const pick = asc ? sameDay[sameDay.length - 1] : sameDay[0];
+      const n = parseAmt(pick.bal);
+      closing = /dr/i.test(pick.bal) ? -Math.abs(n) : n;
+    }
     let added = 0, merged = 0, skipped = 0;
     commit((d) => {
       parsed.forEach((p) => {
@@ -2826,10 +3018,20 @@ function ImportStatement({ db, user, commit, flash }) {
           added++;
         }
       });
+      if (closing != null) {
+        const acct = d.accounts.find((a) => a.id === accountId);
+        if (acct) {
+          const net = d.entries.filter((e) => e.accountId === accountId)
+            .reduce((x, e) => x + (e.type === "Receipt" ? e.amount : -e.amount), 0);
+          acct.balance = closing - net; // opening balance back-derived so opening + entries = the bank's closing
+          acct.lastStatementClosing = closing;
+          acct.lastStatementDate = closingDate;
+        }
+      }
       pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id].filter((id) => id !== user.id),
-        `${user.name} imported ${fname || "a bank statement"}: ${added} new, ${merged} matched with manual entries, ${skipped} already on record`, "Accounts", null);
+        `${user.name} imported ${fname || "a bank statement"}: ${added} new, ${merged} matched with manual entries, ${skipped} already on record${closing != null ? ` · balance synchronised to the bank's closing ${inr(closing)}` : ""}`, "Accounts", null);
     }, { by: user.name, action: "Bank statement imported", detail: `${fname} · ${added} new · ${merged} merged · ${skipped} duplicates` });
-    flash(`Imported: ${added} new, ${merged} merged with manual entries (their ledger/category kept), ${skipped} duplicates skipped`);
+    flash(`Imported: ${added} new, ${merged} merged, ${skipped} duplicates skipped${closing != null ? ` · account balance set from the bank's closing on ${fmtDate(closingDate)}: ${inr(closing)}` : " · no balance column matched, so the balance was not updated"}`);
     setRows(null); setFname("");
   };
 
@@ -2853,6 +3055,17 @@ function ImportStatement({ db, user, commit, flash }) {
       </Field>
       <input ref={fileRef} type="file" accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style={{ display: "none" }} onChange={onFile} />
       <Btn kind="solid" onClick={() => fileRef.current && fileRef.current.click()}>Choose statement file (CSV / XLS / XLSX)</Btn>
+      {rows && det && (det.accountNo || det.ifsc) && !accountId && (
+        <div className="ext">
+          <p className="fhint"><b>Details found inside this statement:</b> {det.bank && `Bank ${det.bank} · `}{det.accountNo && `A/c ${det.accountNo} · `}{det.ifsc && `IFSC ${det.ifsc}`}{det.branch && ` · Branch ${det.branch}`}</p>
+          <SmartSelect label="Company this account belongs to" value={newAcc.company} onChange={(v) => setNewAcc({ ...newAcc, company: v })}
+            options={(db.companies || []).map((c) => c.name)} />
+          <Field label="Account name (how it should appear in the tool)">
+            <input value={newAcc.accountName} onChange={(e) => setNewAcc({ ...newAcc, accountName: e.target.value })} placeholder={det.holder || "e.g. Revanza Estates — Current A/c"} />
+          </Field>
+          <Btn kind="brass" onClick={createFromStatement}>Create this bank account automatically from the statement</Btn>
+        </div>
+      )}
       {rows && (
         <>
           <h4>Column matching — {fname}</h4>
@@ -3449,7 +3662,7 @@ function Salary({ db, user, commit, flash }) {
             <thead><tr><th>Employee</th><th className="amt">Salary</th><th>Present</th><th>Absent</th><th>Leave</th><th>Lates</th><th>Off worked</th><th className="amt">OT (h)</th><th className="amt">OT pay</th><th className="amt">Deducted (days)</th><th className="amt">Net payable</th><th></th></tr></thead>
             <tbody>
               {calcs.map(({ u, c }) => (
-                <tr key={u.id}>
+                <tr key={u.id} onClick={() => setOpenId(u.id)} style={{ cursor: "pointer" }}>
                   <td><b>{u.name}</b><i className="sub">{u.role}</i></td>
                   <td className="amt">{Number(u.salary) ? inr(u.salary) : <span className="muted">not set</span>}</td>
                   <td>{c.present}</td>
@@ -3484,12 +3697,14 @@ function Salary({ db, user, commit, flash }) {
           <h4>Day-by-day register</h4>
           <div className="scroll-x">
             <table className="tbl">
-              <thead><tr><th>Date</th><th>Status</th><th>In</th><th>Out</th><th className="amt">OT mins</th></tr></thead>
+              <thead><tr><th>Date</th><th>Status</th><th>In</th><th>Out</th><th>Late by</th><th>Grace used</th><th className="amt">OT mins</th></tr></thead>
               <tbody>{cur.c.days.map((d0) => (
                 <tr key={d0.date}>
                   <td>{fmtDate(d0.date)}</td>
                   <td className={d0.status === "Absent" ? "danger" : ""}>{d0.status}</td>
                   <td>{d0.inT || "—"}</td><td>{d0.outT || "—"}</td>
+                  <td className={d0.late ? "danger" : ""}>{d0.late ? d0.late + " min" : ""}</td>
+                  <td>{d0.graceUsed ? d0.graceUsed + " min" : ""}</td>
                   <td className="amt">{d0.ot || ""}</td>
                 </tr>))}
               </tbody>
@@ -3736,6 +3951,8 @@ textarea{resize:vertical}
 .danger-zone{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--line2)}
 
 .amt{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.grp td{background:var(--brass-s);font-weight:600;font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:#6D4D11;padding:5px 10px}
+.grp-row{background:var(--brass-s);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:#6D4D11;font-weight:600}
 .cellsel{min-width:130px;padding:5px 6px;font-size:12px}
 .pick{max-height:190px;overflow:auto;border:1px solid var(--line);border-radius:2px;padding:4px 12px;background:#fff}
 .pick .check{margin-bottom:0;border-bottom:1px solid var(--line2);padding:7px 0}
