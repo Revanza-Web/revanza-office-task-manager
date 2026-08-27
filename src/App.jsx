@@ -608,19 +608,80 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
-function CameraButton({ label, kind = "ghost", onShot, disabled }) {
-  const ref = React.useRef(null);
+const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+/* In-app webcam window: live preview → capture → JPEG. Used as the primary
+   path on laptops (where file inputs open the file explorer, never the camera)
+   and as the fallback on phones where the native camera does not open. */
+function CameraCapture({ onShot, onClose, facing = "user" }) {
+  const vRef = React.useRef(null);
+  const [err, setErr] = useState("");
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    let st = null;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setErr("This browser does not allow camera access — use the file option instead");
+      return undefined;
+    }
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: facing }, audio: false })
+      .then((s2) => {
+        st = s2;
+        if (vRef.current) { vRef.current.srcObject = s2; vRef.current.play().catch(() => {}); setReady(true); }
+      })
+      .catch((e) => setErr(/denied|permission/i.test(String(e && e.message)) ?
+        "Camera permission is blocked for this site — allow it via the padlock/lock icon in the address bar, then try again" :
+        (e && e.message) || "The camera could not be started"));
+    return () => { if (st) st.getTracks().forEach((tr) => tr.stop()); };
+  }, [facing]);
+  const snap = () => {
+    const v = vRef.current;
+    if (!v || !v.videoWidth) return;
+    const cv = document.createElement("canvas");
+    const w = Math.min(900, v.videoWidth);
+    cv.width = w; cv.height = Math.round((w * v.videoHeight) / v.videoWidth);
+    cv.getContext("2d").drawImage(v, 0, 0, cv.width, cv.height);
+    onShot(cv.toDataURL("image/jpeg", 0.7));
+    onClose();
+  };
   return (
-    <>
-      <input ref={ref} type="file" accept="image/*" capture="user" style={{ display: "none" }}
-        onChange={async (e) => {
-          const f = e.target.files[0];
-          if (!f) return;
-          try { onShot(await compressImage(f)); } catch { onShot(null); }
-          e.target.value = "";
-        }} />
-      <Btn kind={kind} disabled={disabled} onClick={() => ref.current && ref.current.click()}>{label}</Btn>
-    </>
+    <Modal title="Take the photograph" onClose={onClose}>
+      {err ? <p className="notice">{err}</p> : (
+        <>
+          <video ref={vRef} playsInline muted style={{ width: "100%", borderRadius: 10, background: "#111", transform: facing === "user" ? "scaleX(-1)" : "none" }} />
+          <div className="quick" style={{ marginTop: 12 }}>
+            <Btn kind="solid" disabled={!ready} onClick={snap}>{ready ? "Capture photo" : "Starting camera…"}</Btn>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function CameraButton({ label, kind = "ghost", onShot, disabled, facing = "user" }) {
+  const ref = React.useRef(null);
+  const [cam, setCam] = useState(false);
+  const onFile = async (e) => {
+    const f = e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    try { onShot(await compressImage(f)); } catch { onShot(null); }
+  };
+  const canLiveCam = typeof navigator !== "undefined" && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+  return (
+    <span className="cambtn">
+      <input ref={ref} type="file" accept="image/*" capture={facing}
+        style={{ position: "fixed", left: -10000, top: 0, width: 1, height: 1, opacity: 0 }}
+        onChange={onFile} />
+      <Btn kind={kind} disabled={disabled}
+        onClick={() => { if (!IS_TOUCH_DEVICE && canLiveCam) setCam(true); else if (ref.current) ref.current.click(); }}>{label}</Btn>
+      {!disabled && (
+        <button type="button" className="cam-alt"
+          onClick={() => { if (IS_TOUCH_DEVICE && canLiveCam) setCam(true); else if (ref.current) ref.current.click(); }}>
+          {IS_TOUCH_DEVICE ? "Camera not opening? Tap here" : "…or choose a saved photo"}
+        </button>
+      )}
+      {cam && <CameraCapture facing={facing} onClose={() => setCam(false)} onShot={onShot} />}
+    </span>
   );
 }
 
@@ -3645,7 +3706,7 @@ function PTaskModal({ task, proj, db, user, commit, flash, canBuild, onClose }) 
           ))}
         </div>
       )}
-      {canUpdate && <CameraButton label="Add site photo — GPS, date and time stamped" onShot={addPhoto} />}
+      {canUpdate && <CameraButton label="Add site photo — GPS, date and time stamped" facing="environment" onShot={addPhoto} />}
 
       <h4>Updates</h4>
       {canUpdate && <>
@@ -4002,6 +4063,8 @@ textarea{resize:vertical}
 
 .amt{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .grp td{background:var(--brass-s);font-weight:600;font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:#6D4D11;padding:5px 10px}
+.cambtn{display:inline-flex;flex-direction:column;gap:2px;align-items:flex-start}
+.cam-alt{background:none;border:none;color:#8A6A1F;font-size:11px;cursor:pointer;padding:0;text-decoration:underline}
 .sync-err{position:fixed;left:12px;right:12px;bottom:12px;z-index:99;background:#7A1F1F;color:#fff;padding:12px 16px;border-radius:10px;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
 .sync-err button{float:right;background:none;border:none;color:#fff;font-size:16px;cursor:pointer}
 .grp-row{background:var(--brass-s);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:#6D4D11;font-weight:600}
