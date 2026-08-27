@@ -608,6 +608,7 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
+const APP_VERSION = "v2.7 · 22 Aug 2026";
 const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 /* In-app webcam window: live preview → capture → JPEG. Used as the primary
@@ -868,6 +869,7 @@ export default function App() {
           <div className="side-foot">
             <span className="who"><b>{user.name}</b><i>{user.role}</i></span>
             <button className="signout" onClick={signOut}>Sign out</button>
+            <p style={{ fontSize: 10, opacity: 0.5, marginTop: 6 }}>{APP_VERSION}</p>
           </div>
         </aside>
         {navOpen && <div className="side-scrim" onClick={() => setNavOpen(false)} />}
@@ -975,6 +977,7 @@ function LiveLogin({ onIn }) {
           Only mobile numbers added by the Owner can sign in. First-time users choose their own PIN.
           Forgot your PIN? Ask the Owner to reset it.
         </p>
+        <p className="login-note" style={{ opacity: 0.6, borderTop: "none", paddingTop: 0 }}>{APP_VERSION}</p>
       </div>
     </div>
   );
@@ -1037,6 +1040,7 @@ function Login({ db, commit, onIn }) {
           Demo sign-in: <b>9841344444</b> (Sushil, Owner) with PIN <b>1234</b>. Other staff records still show
           their mobile number as “Pending Information”, so use role preview below until the Owner fills them in.
         </p>
+        <p className="login-note" style={{ opacity: 0.6, borderTop: "none", paddingTop: 0 }}>{APP_VERSION}</p>
         <button className="linkish" onClick={() => setShowDemo((v) => !v)}>{showDemo ? "Hide" : "Preview another role"}</button>
         {showDemo && (
           <div className="demo-list">
