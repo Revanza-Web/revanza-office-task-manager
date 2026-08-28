@@ -608,7 +608,7 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
-const APP_VERSION = "v2.7 · 22 Aug 2026";
+const APP_VERSION = "v2.8 · 22 Aug 2026";
 const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 /* In-app webcam window: live preview → capture → JPEG. Used as the primary
@@ -776,6 +776,26 @@ export default function App() {
     window.addEventListener("focus", refresh);
     return () => { clearInterval(iv); window.removeEventListener("focus", refresh); };
   }, [me]);
+
+  // lapsed hearing dates: mark and notify MD and the whole legal team, once per case per day
+  useEffect(() => {
+    if (!db || !me) return;
+    const u0 = db.users.find((x) => x.id === me);
+    if (!u0 || (u0.role !== OWNER && u0.role !== "Legal Associate")) return;
+    const t0 = today();
+    const lapsed = (db.cases || []).filter((c) => c.stage !== "Disposed" && c.nextHearing && c.nextHearing < t0 && c.hearingLapseNotified !== t0);
+    if (!lapsed.length) return;
+    commit((d) => {
+      const legalIds = d.users.filter((x) => x.role === "Legal Associate" && x.status === "Active").map((x) => x.id);
+      const ownerId = d.users.find((x) => x.role === OWNER)?.id;
+      lapsed.forEach((c0) => {
+        const x = d.cases.find((y) => y.id === c0.id);
+        if (!x || x.hearingLapseNotified === t0) return;
+        x.hearingLapseNotified = t0;
+        pushNotify(d, [ownerId, ...legalIds], `${x.caseNo} — the hearing date ${fmtDate(x.nextHearing)} has passed. Please enter the next hearing date.`, "Hearing date lapsed", { kind: "case", id: x.id });
+      });
+    }, null);
+  }, [db, me]);
 
   // contractors land on (and stay in) the Projects area
   useEffect(() => {
@@ -2103,7 +2123,7 @@ function Cases({ db, user, commit, flash, preset, focus }) {
 
   return (
     <>
-      <Panel title="Legal cases" sub={`${rows.length} matter(s)`} right={(isOwner || user.role === "Legal Associate") && <Btn kind="solid" onClick={() => setCreating(true)}>Add case</Btn>}>
+      <Panel title="Legal cases" sub={`${rows.length} matter(s) · green edge = our matters · amber edge = third-party matters`} right={(isOwner || user.role === "Legal Associate") && <Btn kind="solid" onClick={() => setCreating(true)}>Add case</Btn>}>
         <div className="filters">
           <input placeholder="Search case number, title, court…" value={q} onChange={(e) => setQ(e.target.value)} />
           <select value={stage} onChange={(e) => setStage(e.target.value)}><option value="">All stages</option>{CASE_STAGE.map((s) => <option key={s}>{s}</option>)}</select>
@@ -2118,12 +2138,12 @@ function Cases({ db, user, commit, flash, preset, focus }) {
             <table className="tbl">
               <thead><tr><th>Case no.</th><th>Title</th><th>Court</th><th>Associate</th><th>Stage</th><th>Next hearing</th><th>Next action</th><th></th></tr></thead>
               <tbody>{rows.map((c) => (
-                <tr key={c.id} className={c.nextHearing === t ? "row-danger" : ""}>
+                <tr key={c.id} className={`${c.nextHearing === t ? "row-danger " : ""}${/third/i.test(c.ourRole || "") ? "row-third" : "row-ours"}`}>
                   <td className="mono">{c.caseNo}</td>
                   <td><b>{titleCase(c.title)}</b><i className="sub">{c.type}</i></td>
                   <td>{c.court}</td><td>{uname(db, c.associate)}</td>
                   <td><Badge t={c.stage === "Disposed" ? "grey" : "blue"}>{c.stage}</Badge></td>
-                  <td>{c.nextHearing ? fmtDate(c.nextHearing) : <Badge t="orange">Not entered</Badge>}</td>
+                  <td>{c.stage === "Disposed" ? <Badge t="grey">Disposed</Badge> : c.nextHearing && c.nextHearing >= t ? fmtDate(c.nextHearing) : <Badge t="orange">Not entered</Badge>}</td>
                   <td>{titleCase(c.nextAction)}</td>
                   <td><Btn onClick={() => setOpen(c.id)}>Open</Btn></td>
                 </tr>))}
@@ -2140,7 +2160,7 @@ function Cases({ db, user, commit, flash, preset, focus }) {
 
 function CaseDetail({ c, db, user, commit, flash, onClose }) {
   const [f, setF] = useState({
-    text: "", stage: c.stage, nextHearing: c.nextHearing || "", nextAction: c.nextAction || "",
+    text: "", stage: c.stage, nextHearing: c.nextHearing || "", nextAction: c.nextAction || "", ourRole: c.ourRole || "We are the Petitioner / Plaintiff",
     orderCopy: c.orderCopy, orderFiles: c.orderFiles || [],
   });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value });
@@ -2150,7 +2170,8 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
     commit((d) => {
       const x = d.cases.find((y) => y.id === c.id);
       x.updates.unshift({ ts: Date.now(), by: user.name, text: f.text, stage: f.stage, nextHearing: f.nextHearing, nextAction: f.nextAction });
-      x.lastHearing = today(); x.stage = f.stage; x.nextHearing = f.nextHearing;
+      x.lastHearing = today(); x.stage = f.stage; x.nextHearing = f.stage === "Disposed" ? "" : f.nextHearing;
+      x.ourRole = f.ourRole || x.ourRole;
       x.nextAction = titleCase(f.nextAction); x.orderCopy = f.orderCopy || f.orderFiles.length > 0; x.orderFiles = f.orderFiles;
       learn(d, "caseStages", f.stage); learn(d, "nextActions", f.nextAction);
       pushNotify(d, [d.users.find((u) => u.role === OWNER)?.id, x.associate].filter((id) => id !== user.id),
@@ -2196,7 +2217,7 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
         <div><span>Counsel</span><b>{c.counsel}</b></div>
         <div><span>Associate</span><b>{uname(db, c.associate)}</b></div>
         <div><span>Last hearing</span><b>{fmtDate(c.lastHearing)}</b></div>
-        <div><span>Next hearing</span><b>{c.nextHearing ? fmtDate(c.nextHearing) : "Not entered"}</b></div>
+        <div><span>Next hearing</span><b>{c.stage === "Disposed" ? "Disposed" : c.nextHearing && c.nextHearing >= today() ? fmtDate(c.nextHearing) : "Not entered"}</b></div>
         <div><span>Filing deadline</span><b>{c.filingDeadline ? fmtDate(c.filingDeadline) : "—"}</b></div>
         <div><span>Order copy</span><b>{c.orderCopy ? "On record" : "Not uploaded"}</b></div>
         <div><span>Risk</span><b>{c.risk}</b></div>
@@ -2211,6 +2232,11 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
       <Field label="What happened today"><textarea rows={3} value={f.text} onChange={set("text")} placeholder="Order passed / adjourned / counter filed…" /></Field>
       <div className="row2">
         <SmartSelect label="Current status of the matter" value={f.stage} onChange={(v) => setF({ ...f, stage: v })} options={stageOptions} />
+        <Field label="Our position in this matter">
+          <select value={f.ourRole} onChange={(e) => setF({ ...f, ourRole: e.target.value })}>
+            {["We are the Petitioner / Plaintiff", "We are the Respondent / Defendant", "Third party — we are neither petitioner nor respondent"].map((o) => <option key={o}>{o}</option>)}
+          </select>
+        </Field>
         <Field label="Next hearing date"><input type="date" value={f.nextHearing} onChange={set("nextHearing")} /></Field>
       </div>
       <SmartSelect label="Next course of action" value={f.nextAction} onChange={(v) => setF({ ...f, nextAction: v })}
@@ -2267,7 +2293,25 @@ function AddCase({ db, user, commit, flash, onClose }) {
     morePetitioners: [], moreRespondents: [],
     counsel: "", associate: "", entity: "", stage: "Appearance Stage", status: "", lastHearing: "", nextHearing: "",
     nextAction: "", filingDeadline: "", briefingDate: "", conferenceDate: "", priority: "Medium", risk: "Medium",
+    ourRole: "We are the Petitioner / Plaintiff",
   });
+  const [history, setHistory] = useState("");
+  const [docs, setDocs] = useState([]);
+  const [docLabel, setDocLabel] = useState("Order copy");
+  const addDoc = async (e) => {
+    const fl = e.target.files[0];
+    e.target.value = "";
+    if (!fl) return;
+    if (fl.size > 4 * 1024 * 1024) return flash("This file is over 4 MB — photograph the pages or compress the PDF and try again");
+    let data = null;
+    try {
+      if (/^image\//.test(fl.type)) data = await compressImage(fl, 1100, 0.75);
+      else data = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(fl); });
+    } catch { data = null; }
+    if (!data) return flash("The file could not be read — try a photo or a PDF");
+    setDocs([{ ts: Date.now(), by: user.name, name: fl.name, label: (docLabel || "Document").trim(), data }, ...docs]);
+    flash(`${docLabel} attached — it will be saved with the case`);
+  };
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const setList = (k, i, v) => setF({ ...f, [k]: f[k].map((x, j) => (j === i ? v : x)) });
   const save = () => {
@@ -2277,11 +2321,16 @@ function AddCase({ db, user, commit, flash, onClose }) {
       learn(d, "caseTypes", f.type); learn(d, "courts", f.court); learn(d, "judges", f.judge);
       learn(d, "counsels", f.counsel); learn(d, "sections", f.sections); learn(d, "entities", f.entity);
       learn(d, "caseStages", f.stage);
+      d.masters.caseDocTypes = d.masters.caseDocTypes || [];
+      docs.forEach((d0) => learn(d, "caseDocTypes", d0.label));
       d.cases.push({
         id: uid("c"), ref, ...f,
+        title: titleCase(f.title.trim()), nextAction: titleCase(f.nextAction),
+        nextHearing: f.stage === "Disposed" ? "" : f.nextHearing,
         morePetitioners: f.morePetitioners.filter((x) => x.trim()),
         moreRespondents: f.moreRespondents.filter((x) => x.trim()),
-        orderCopy: false, orderFiles: [], updates: [],
+        orderCopy: docs.some((d0) => /order|judgment|decree/i.test(d0.label)), orderFiles: [], docs,
+        updates: history.trim() ? [{ ts: Date.now(), by: user.name, text: "Case history: " + history.trim() }] : [],
       });
       pushNotify(d, [f.associate].filter((id) => id !== user.id), `New case assigned to you: ${f.caseNo} — ${f.title}`, "Case assigned", null);
     }, { by: user.name, action: "Case added", detail: f.caseNo });
@@ -2296,6 +2345,11 @@ function AddCase({ db, user, commit, flash, onClose }) {
           hint="Anything added under Others joins this list next time." />
       </div>
 
+      <Field label="Our position in this matter" hint="Our matters and third-party matters are colour-marked in the register.">
+        <select value={f.ourRole} onChange={set("ourRole")}>
+          {["We are the Petitioner / Plaintiff", "We are the Respondent / Defendant", "Third party — we are neither petitioner nor respondent"].map((o) => <option key={o}>{o}</option>)}
+        </select>
+      </Field>
       <Field label="Petitioner"><input value={f.petitioner} onChange={set("petitioner")} /></Field>
       {f.morePetitioners.map((x, i) => (
         <Field key={"p" + i} label={`Additional petitioner ${i + 2}`}>
@@ -2341,6 +2395,27 @@ function AddCase({ db, user, commit, flash, onClose }) {
       </div>
       <Field label="Filing deadline (if any)"><input type="date" value={f.filingDeadline} onChange={set("filingDeadline")} /></Field>
       <Field label="Next course of action"><input value={f.nextAction} onChange={set("nextAction")} /></Field>
+      <Field label="Case history (optional)" hint="Background of the matter — saved as the first entry in the case history.">
+        <textarea rows={3} value={history} onChange={(e) => setHistory(e.target.value)} placeholder="How the dispute arose, proceedings so far, key dates…" />
+      </Field>
+      <h4>Documents on record</h4>
+      {docs.length > 0 && (
+        <ul className="feed">
+          {docs.map((d0, i) => (
+            <li key={i}><span className="feed-m">{d0.label} · {d0.name}</span>
+              <Btn onClick={() => setDocs(docs.filter((x2, j) => j !== i))}>Remove</Btn>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="row2">
+        <SmartSelect label="Document type" value={docLabel} onChange={setDocLabel}
+          options={[...new Set(["Order copy", "Judgment", "Petition", "Counter", "Rejoinder", "Evidence", "Vakalat", "Notice", ...(db.masters.caseDocTypes || [])])]}
+          hint="Add your own type under Others — it joins this list." />
+        <Field label="Upload the file (image or PDF, up to 4 MB)">
+          <input type="file" accept="image/*,application/pdf" onChange={addDoc} />
+        </Field>
+      </div>
       <Btn kind="solid" full onClick={save}>Add case</Btn>
     </Modal>
   );
@@ -4067,6 +4142,8 @@ textarea{resize:vertical}
 
 .amt{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .grp td{background:var(--brass-s);font-weight:600;font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:#6D4D11;padding:5px 10px}
+.row-ours>td:first-child{box-shadow:inset 3px 0 0 #2F7D4F}
+.row-third>td:first-child{box-shadow:inset 3px 0 0 #B7791F}
 .cambtn{display:inline-flex;flex-direction:column;gap:2px;align-items:flex-start}
 .cam-alt{background:none;border:none;color:#8A6A1F;font-size:11px;cursor:pointer;padding:0;text-decoration:underline}
 .sync-err{position:fixed;left:12px;right:12px;bottom:12px;z-index:99;background:#7A1F1F;color:#fff;padding:12px 16px;border-radius:10px;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
