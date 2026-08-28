@@ -608,7 +608,7 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
-const APP_VERSION = "v2.8 · 22 Aug 2026";
+const APP_VERSION = "v2.9 · 22 Aug 2026";
 const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 /* In-app webcam window: live preview → capture → JPEG. Used as the primary
@@ -2158,6 +2158,62 @@ function Cases({ db, user, commit, flash, preset, focus }) {
   );
 }
 
+function SubCaseForm({ db, c, sub, user, commit, flash, onClose }) {
+  // On "Add sub case", petitioner, respondent, order, stage and hearing date are
+  // pre-captured from the main case; edits here never touch the main case.
+  const [f, setF] = useState(sub ? { ...sub } : {
+    caseNo: "", type: c.type || "",
+    petitioner: c.petitioner || "", respondent: c.respondent || "",
+    order: c.order || "", stage: c.stage || "Appearance Stage", hearing: c.nextHearing || "",
+  });
+  const opts = (key, extra = []) => [...new Set([...extra, ...((db.masters && db.masters[key]) || [])])].filter(Boolean);
+  const allSubNos = db.cases.flatMap((x) => (x.subcases || []).map((y) => y.caseNo));
+  const save = () => {
+    if (!f.caseNo.trim()) return flash("The sub-case number is required");
+    commit((d) => {
+      ["subCaseNos", "petitioners", "respondents", "orders"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
+      learn(d, "subCaseNos", f.caseNo); learn(d, "caseTypes", f.type);
+      learn(d, "petitioners", f.petitioner); learn(d, "respondents", f.respondent);
+      learn(d, "orders", f.order); learn(d, "caseStages", f.stage);
+      const x = d.cases.find((y) => y.id === c.id);
+      x.subcases = x.subcases || [];
+      if (sub) {
+        const y = x.subcases.find((z) => z.id === sub.id);
+        if (y) Object.assign(y, f, { hearing: f.stage === "Disposed" ? "" : f.hearing });
+      } else {
+        x.subcases.push({ ...f, id: uid("sc"), hearing: f.stage === "Disposed" ? "" : f.hearing });
+      }
+      pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id, x.associate].filter((id) => id && id !== user.id),
+        `${c.caseNo}: sub-case ${f.caseNo} ${sub ? "updated" : "added"} by ${user.name}`, "Sub-case", { kind: "case", id: c.id });
+    }, { by: user.name, action: sub ? "Sub-case updated" : "Sub-case added", detail: `${c.caseNo} › ${f.caseNo}` });
+    flash(sub ? "Sub-case updated" : "Sub-case added under " + c.caseNo); onClose();
+  };
+  return (
+    <Modal title={sub ? `Edit sub-case ${sub.caseNo}` : `Add sub case — under ${c.caseNo}`} onClose={onClose} wide>
+      <div className="row2">
+        <SmartSelect label="Sub-case number" value={f.caseNo} onChange={(v) => setF({ ...f, caseNo: v })}
+          options={opts("subCaseNos", allSubNos)} hint="Pick an existing number or add a new one under Others." />
+        <SmartSelect label="Case type" value={f.type} onChange={(v) => setF({ ...f, type: v })} options={opts("caseTypes")} />
+      </div>
+      <div className="row2">
+        <SmartSelect label="Petitioner" value={f.petitioner} onChange={(v) => setF({ ...f, petitioner: v })}
+          options={opts("petitioners", [c.petitioner, ...(c.morePetitioners || [])])} />
+        <SmartSelect label="Respondent" value={f.respondent} onChange={(v) => setF({ ...f, respondent: v })}
+          options={opts("respondents", [c.respondent, ...(c.moreRespondents || [])])} />
+      </div>
+      <div className="row2">
+        <SmartSelect label="Order" value={f.order} onChange={(v) => setF({ ...f, order: v })}
+          options={opts("orders", ["Interim Order", "Stay Granted", "Status Quo", "Adjourned", "Ex-Parte Order", "Final Order"])} />
+        <SmartSelect label="Stage" value={f.stage} onChange={(v) => setF({ ...f, stage: v })}
+          options={[...new Set([...CASE_STAGE, ...(db.masters.caseStages || [])])]} />
+      </div>
+      <Field label="Hearing date"><input type="date" value={f.hearing || ""} onChange={(e) => setF({ ...f, hearing: e.target.value })} /></Field>
+      <p className="fhint">Pre-filled from the main case — change anything here freely; the main case is never affected.</p>
+      <Btn kind="solid" full onClick={save}>{sub ? "Save changes" : "Add sub case"}</Btn>
+    </Modal>
+  );
+}
+
 function CaseDetail({ c, db, user, commit, flash, onClose }) {
   const [f, setF] = useState({
     text: "", stage: c.stage, nextHearing: c.nextHearing || "", nextAction: c.nextAction || "", ourRole: c.ourRole || "We are the Petitioner / Plaintiff",
@@ -2181,6 +2237,8 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
     flash("Case updated — the Owner's calendar entry moves with the new hearing date");
     setF({ ...f, text: "" });
   };
+  const [sub, setSub] = useState(null);
+  const canEditCase = user.role === OWNER || user.role === "Legal Associate";
   const [docLabel, setDocLabel] = useState("Order copy");
   const addDoc = async (e) => {
     const fl = e.target.files[0];
@@ -2242,6 +2300,27 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
       <SmartSelect label="Next course of action" value={f.nextAction} onChange={(v) => setF({ ...f, nextAction: v })}
         options={db.masters.nextActions} hint="Discussion, Conference, Briefing, Appearance — or add your own under Others." />
       <Btn kind="solid" full onClick={save}>Save case update</Btn>
+
+      <h4>Sub-cases</h4>
+      {!(c.subcases || []).length ? <Empty>No sub-cases under this matter.</Empty> : (
+        <div className="scroll-x">
+          <table className="tbl">
+            <thead><tr><th>Case no.</th><th>Type</th><th>Petitioner</th><th>Respondent</th><th>Order</th><th>Stage</th><th>Hearing</th><th></th></tr></thead>
+            <tbody>{c.subcases.map((sc) => (
+              <tr key={sc.id}>
+                <td className="mono">{sc.caseNo}</td><td>{sc.type}</td>
+                <td>{sc.petitioner}</td><td>{sc.respondent}</td>
+                <td>{sc.order || "—"}</td>
+                <td><Badge t={sc.stage === "Disposed" ? "grey" : "blue"}>{sc.stage}</Badge></td>
+                <td>{sc.stage === "Disposed" ? "Disposed" : sc.hearing ? fmtDate(sc.hearing) : "Not entered"}</td>
+                <td>{canEditCase && <Btn onClick={() => setSub(sc)}>Edit</Btn>}</td>
+              </tr>))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {canEditCase && <div className="quick" style={{ marginBottom: 14 }}><Btn kind="brass" onClick={() => setSub("new")}>Add sub case</Btn></div>}
+      {sub && <SubCaseForm db={db} c={c} sub={sub === "new" ? null : sub} user={user} commit={commit} flash={flash} onClose={() => setSub(null)} />}
 
       <h4>Documents on record</h4>
       {!(c.docs || []).length ? <Empty>No files uploaded on this matter yet.</Empty> : (
