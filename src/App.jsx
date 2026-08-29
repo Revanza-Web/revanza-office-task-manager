@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
-import { LIVE, sbSession, sbSignIn, sbSignUp, sbChangePin, sbSignOut, fetchAll, syncDB } from "./lib/db.js";
+import { LIVE, sbSession, sbSignIn, sbSignUp, sbChangePin, sbSignOut, fetchAll, fetchDelta, syncDB, sbUpload } from "./lib/db.js";
 import * as XLSX from "xlsx";
 
 /* ============================================================
@@ -188,6 +188,10 @@ function guessColumns(hdr) {
   };
 }
 const cleanMobile = (v) => String(v || "").replace(/[^0-9]/g, "").slice(-10);
+async function persistFile(dataUrl, name) {
+  if (!LIVE || !dataUrl || !String(dataUrl).startsWith("data:")) return dataUrl;
+  try { return (await sbUpload(dataUrl, name)) || dataUrl; } catch { return dataUrl; }
+}
 const titleCase = (t) => String(t || "").toLowerCase().replace(/(^|[\s\-/(&.,])([a-z])/g, (m, a, b) => a + b.toUpperCase());
 const parseDrCr = (sv) => /d\s*r/i.test(String(sv || "")) ? "Payment" : /c\s*r/i.test(String(sv || "")) ? "Receipt" : null;
 
@@ -608,7 +612,7 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
-const APP_VERSION = "v2.10 · 28 Aug 2026";
+const APP_VERSION = "v3.0 · 28 Aug 2026";
 const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 /* In-app webcam window: live preview → capture → JPEG. Used as the primary
@@ -772,13 +776,34 @@ export default function App() {
   useEffect(() => {
     if (!LIVE || !me) return;
     let last = 0;
+    const mergeList = (oldL, newL) => {
+      if (!newL || !newL.length) return oldL;
+      const ids = new Set(newL.map((x) => x.id));
+      return [...newL, ...(oldL || []).filter((x) => !ids.has(x.id))];
+    };
     const refresh = async (minGap) => {
       if (Date.now() - last < minGap) return; // don't stampede the server
       last = Date.now();
-      try { setDb(await fetchAll()); } catch { /* offline */ }
+      try {
+        const d2 = await fetchDelta();
+        if (!d2) { setDb(await fetchAll()); return; }
+        setDb((prev) => {
+          if (!prev) return prev;
+          const nx = { ...prev, masters: d2.masters, locations: d2.locations, settings: d2.settings || prev.settings };
+          const keyMap = { profiles: "users" };
+          Object.entries(d2.changed).forEach(([k, rowsChanged]) => {
+            const stateKey = keyMap[k] || k;
+            const mapped = rowsChanged.map((r) => (k === "profiles"
+              ? { ...r.data, id: r.id, authId: r.auth_id }
+              : r.data));
+            nx[stateKey] = mergeList(prev[stateKey], mapped);
+          });
+          return nx;
+        });
+      } catch { /* offline */ }
     };
-    const iv = setInterval(() => refresh(0), 180000);
-    const onFocus = () => refresh(120000);
+    const iv = setInterval(() => refresh(0), 90000);
+    const onFocus = () => refresh(45000);
     window.addEventListener("focus", onFocus);
     return () => { clearInterval(iv); window.removeEventListener("focus", onFocus); };
   }, [me]);
@@ -1669,6 +1694,7 @@ function TaskDetail({ task, db, user, commit, flash, onClose }) {
   const addPhoto = async (img) => {
     if (!img) return flash("The photo could not be read");
     const g = await getGPS();
+    img = await persistFile(img, "task-photo.jpg");
     mutate((tk) => tk.docs.unshift({ ts: Date.now(), by: user.name, img, lat: g.lat, lng: g.lng }), "Photo attached");
     flash(g.lat != null ? "Photo attached with GPS, date and time" : "Photo attached — GPS unavailable, time recorded");
   };
@@ -1914,6 +1940,7 @@ function Attendance({ db, user, commit, flash }) {
 
   const punch = async (kind, mode, photo) => {
     if (!photo) return flash("A photograph is compulsory for attendance — the camera shot did not come through");
+    photo = await persistFile(photo, "attendance.jpg");
     setBusy(true);
     const g = await getGPS();
     const dist = g.lat != null ? haversine(g.lat, g.lng, loc.lat, loc.lng) : null;
@@ -2082,7 +2109,7 @@ function Leave({ db, user, commit, flash }) {
         <Field label="Additional details (optional)"><textarea rows={2} value={f.detail} onChange={set("detail")} /></Field>
         {f.type === "Medical" && (
           <>
-            <CameraButton label={f.docImg ? "Retake prescription photo" : "Attach prescription photo"} onShot={(img) => { setF({ ...f, docImg: img }); flash("Prescription attached"); }} />
+            <CameraButton label={f.docImg ? "Retake prescription photo" : "Attach prescription photo"} onShot={async (img) => { const u2 = await persistFile(img, "prescription.jpg"); setF({ ...f, docImg: u2 }); flash("Prescription attached"); }} />
             {f.docImg ? <div className="thumbs"><figure><img src={f.docImg} className="thumb-lg" alt="Prescription" /><figcaption>Attached prescription</figcaption></figure></div>
               : <p className="fhint" style={{ marginTop: 8 }}>Medical leave without a prescription is flagged to the Owner as missing a supporting document.</p>}
           </>
@@ -2267,13 +2294,14 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
     const fl = e.target.files[0];
     if (!fl) return;
     e.target.value = "";
-    if (fl.size > 4 * 1024 * 1024) return flash("This file is over 4 MB — photograph the pages or compress the PDF and try again");
+    if (fl.size > 15 * 1024 * 1024) return flash("This file is over 15 MB — compress the PDF and try again");
     let data = null;
     try {
       if (/^image\//.test(fl.type)) data = await compressImage(fl, 1100, 0.75);
       else data = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(fl); });
     } catch { data = null; }
     if (!data) return flash("The file could not be read — try a photo or a PDF");
+    data = await persistFile(data, fl.name);
     const lbl = (docLabel || "Document").trim();
     commit((d) => {
       const x = d.cases.find((y) => y.id === c.id);
@@ -2361,7 +2389,7 @@ function CaseDetail({ c, db, user, commit, flash, onClose }) {
         <SmartSelect label="Document type" value={docLabel} onChange={setDocLabel}
           options={[...new Set(["Order copy", "Judgment", "Petition", "Counter", "Rejoinder", "Evidence", "Vakalat", "Notice", ...(db.masters.caseDocTypes || [])])]}
           hint="Pick a type or add your own under Others — new types join this list automatically." />
-        <Field label="Upload the file (image or PDF, up to 4 MB)">
+        <Field label="Upload the file (image or PDF, up to 15 MB)">
           <input type="file" accept="image/*,application/pdf" onChange={addDoc} />
         </Field>
       </div>
@@ -2406,13 +2434,14 @@ function AddCase({ db, user, commit, flash, onClose }) {
     const fl = e.target.files[0];
     e.target.value = "";
     if (!fl) return;
-    if (fl.size > 4 * 1024 * 1024) return flash("This file is over 4 MB — photograph the pages or compress the PDF and try again");
+    if (fl.size > 15 * 1024 * 1024) return flash("This file is over 15 MB — compress the PDF and try again");
     let data = null;
     try {
       if (/^image\//.test(fl.type)) data = await compressImage(fl, 1100, 0.75);
       else data = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(fl); });
     } catch { data = null; }
     if (!data) return flash("The file could not be read — try a photo or a PDF");
+    data = await persistFile(data, fl.name);
     setDocs([{ ts: Date.now(), by: user.name, name: fl.name, label: (docLabel || "Document").trim(), data }, ...docs]);
     flash(`${docLabel} attached — it will be saved with the case`);
   };
@@ -2550,7 +2579,7 @@ function AddCase({ db, user, commit, flash, onClose }) {
         <SmartSelect label="Document type" value={docLabel} onChange={setDocLabel}
           options={[...new Set(["Order copy", "Judgment", "Petition", "Counter", "Rejoinder", "Evidence", "Vakalat", "Notice", ...(db.masters.caseDocTypes || [])])]}
           hint="Add your own type under Others — it joins this list." />
-        <Field label="Upload the file (image or PDF, up to 4 MB)">
+        <Field label="Upload the file (image or PDF, up to 15 MB)">
           <input type="file" accept="image/*,application/pdf" onChange={addDoc} />
         </Field>
       </div>
@@ -3848,6 +3877,7 @@ function PTaskModal({ task, proj, db, user, commit, flash, canBuild, onClose }) 
   const addPhoto = async (img) => {
     if (!img) return flash("The photo could not be read");
     const g = await getGPS();
+    img = await persistFile(img, "site-photo.jpg");
     mutate((x) => x.docs.unshift({ ts: Date.now(), by: user.name, img, lat: g.lat, lng: g.lng }), "Site photo attached");
     flash(g.lat != null ? "Photo attached with GPS, date and time" : "Photo attached — GPS unavailable");
   };
