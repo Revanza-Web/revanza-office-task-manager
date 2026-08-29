@@ -608,7 +608,7 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
-const APP_VERSION = "v2.9 · 22 Aug 2026";
+const APP_VERSION = "v2.10 · 28 Aug 2026";
 const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 /* In-app webcam window: live preview → capture → JPEG. Used as the primary
@@ -771,10 +771,16 @@ export default function App() {
   // live mode: pull everyone else's changes every 45 s and on window focus
   useEffect(() => {
     if (!LIVE || !me) return;
-    const refresh = async () => { try { setDb(await fetchAll()); } catch { /* offline */ } };
-    const iv = setInterval(refresh, 45000);
-    window.addEventListener("focus", refresh);
-    return () => { clearInterval(iv); window.removeEventListener("focus", refresh); };
+    let last = 0;
+    const refresh = async (minGap) => {
+      if (Date.now() - last < minGap) return; // don't stampede the server
+      last = Date.now();
+      try { setDb(await fetchAll()); } catch { /* offline */ }
+    };
+    const iv = setInterval(() => refresh(0), 180000);
+    const onFocus = () => refresh(120000);
+    window.addEventListener("focus", onFocus);
+    return () => { clearInterval(iv); window.removeEventListener("focus", onFocus); };
   }, [me]);
 
   // lapsed hearing dates: mark and notify MD and the whole legal team, once per case per day
@@ -2158,7 +2164,7 @@ function Cases({ db, user, commit, flash, preset, focus }) {
   );
 }
 
-function SubCaseForm({ db, c, sub, user, commit, flash, onClose }) {
+function SubCaseForm({ db, c, sub, user, commit, flash, onClose, onLocal }) {
   // On "Add sub case", petitioner, respondent, order, stage and hearing date are
   // pre-captured from the main case; edits here never touch the main case.
   const [f, setF] = useState(sub ? { ...sub } : {
@@ -2167,12 +2173,29 @@ function SubCaseForm({ db, c, sub, user, commit, flash, onClose }) {
     order: c.order || "", stage: c.stage || "Appearance Stage", hearing: c.nextHearing || "",
   });
   const opts = (key, extra = []) => [...new Set([...extra, ...((db.masters && db.masters[key]) || [])])].filter(Boolean);
-  const allSubNos = db.cases.flatMap((x) => (x.subcases || []).map((y) => y.caseNo));
+  // every known sub-case number, paired with its case type
+  const pairs = [
+    ...((db.masters.subCaseNoPairs || []).map((x2) => x2.split("||"))),
+    ...db.cases.flatMap((x2) => (x2.subcases || []).map((y) => [y.type || "", y.caseNo])),
+    ...((db.masters.subCaseNos || []).map((n) => ["", n])),
+  ].filter(([, n]) => n);
+  const totalNums = [...new Set(pairs.map(([, n]) => n))];
+  const bigList = totalNums.length > 10;
+  const numOptions = bigList && f.type
+    ? [...new Set(pairs.filter(([tp]) => tp === f.type).map(([, n]) => n))]
+    : totalNums;
   const save = () => {
     if (!f.caseNo.trim()) return flash("The sub-case number is required");
+    if (onLocal) {
+      onLocal({ ...f, id: sub ? sub.id : uid("sc"), hearing: f.stage === "Disposed" ? "" : f.hearing });
+      flash(sub ? "Sub-case updated — it saves with the case" : "Sub-case staged — it saves together with the case");
+      return;
+    }
     commit((d) => {
-      ["subCaseNos", "petitioners", "respondents", "orders"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
+      ["subCaseNos", "subCaseNoPairs", "petitioners", "respondents", "orders"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
       learn(d, "subCaseNos", f.caseNo); learn(d, "caseTypes", f.type);
+      const enc = `${f.type}||${f.caseNo.trim()}`;
+      if (!d.masters.subCaseNoPairs.includes(enc)) d.masters.subCaseNoPairs.push(enc);
       learn(d, "petitioners", f.petitioner); learn(d, "respondents", f.respondent);
       learn(d, "orders", f.order); learn(d, "caseStages", f.stage);
       const x = d.cases.find((y) => y.id === c.id);
@@ -2192,7 +2215,7 @@ function SubCaseForm({ db, c, sub, user, commit, flash, onClose }) {
     <Modal title={sub ? `Edit sub-case ${sub.caseNo}` : `Add sub case — under ${c.caseNo}`} onClose={onClose} wide>
       <div className="row2">
         <SmartSelect label="Sub-case number" value={f.caseNo} onChange={(v) => setF({ ...f, caseNo: v })}
-          options={opts("subCaseNos", allSubNos)} hint="Pick an existing number or add a new one under Others." />
+          options={numOptions} hint={bigList && f.type ? `Over 10 numbers on record — showing only ${f.type} numbers. Change the case type to see others.` : "Pick an existing number or add a new one under Others."} />
         <SmartSelect label="Case type" value={f.type} onChange={(v) => setF({ ...f, type: v })} options={opts("caseTypes")} />
       </div>
       <div className="row2">
@@ -2375,6 +2398,8 @@ function AddCase({ db, user, commit, flash, onClose }) {
     ourRole: "We are the Petitioner / Plaintiff",
   });
   const [history, setHistory] = useState("");
+  const [subs, setSubs] = useState([]);
+  const [subOpen, setSubOpen] = useState(null);
   const [docs, setDocs] = useState([]);
   const [docLabel, setDocLabel] = useState("Order copy");
   const addDoc = async (e) => {
@@ -2402,13 +2427,19 @@ function AddCase({ db, user, commit, flash, onClose }) {
       learn(d, "caseStages", f.stage);
       d.masters.caseDocTypes = d.masters.caseDocTypes || [];
       docs.forEach((d0) => learn(d, "caseDocTypes", d0.label));
+      ["subCaseNos", "petitioners", "respondents", "orders"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
+      subs.forEach((sc) => {
+        learn(d, "subCaseNos", sc.caseNo); learn(d, "caseTypes", sc.type);
+        learn(d, "petitioners", sc.petitioner); learn(d, "respondents", sc.respondent);
+        learn(d, "orders", sc.order); learn(d, "caseStages", sc.stage);
+      });
       d.cases.push({
         id: uid("c"), ref, ...f,
         title: titleCase(f.title.trim()), nextAction: titleCase(f.nextAction),
         nextHearing: f.stage === "Disposed" ? "" : f.nextHearing,
         morePetitioners: f.morePetitioners.filter((x) => x.trim()),
         moreRespondents: f.moreRespondents.filter((x) => x.trim()),
-        orderCopy: docs.some((d0) => /order|judgment|decree/i.test(d0.label)), orderFiles: [], docs,
+        orderCopy: docs.some((d0) => /order|judgment|decree/i.test(d0.label)), orderFiles: [], docs, subcases: subs,
         updates: history.trim() ? [{ ts: Date.now(), by: user.name, text: "Case history: " + history.trim() }] : [],
       });
       pushNotify(d, [f.associate].filter((id) => id !== user.id), `New case assigned to you: ${f.caseNo} — ${f.title}`, "Case assigned", null);
@@ -2474,6 +2505,34 @@ function AddCase({ db, user, commit, flash, onClose }) {
       </div>
       <Field label="Filing deadline (if any)"><input type="date" value={f.filingDeadline} onChange={set("filingDeadline")} /></Field>
       <Field label="Next course of action"><input value={f.nextAction} onChange={set("nextAction")} /></Field>
+      <h4>Sub-cases</h4>
+      {subs.length > 0 && (
+        <div className="scroll-x">
+          <table className="tbl">
+            <thead><tr><th>Case no.</th><th>Type</th><th>Stage</th><th>Hearing</th><th></th></tr></thead>
+            <tbody>{subs.map((sc) => (
+              <tr key={sc.id}>
+                <td className="mono">{sc.caseNo}</td><td>{sc.type}</td>
+                <td>{sc.stage}</td>
+                <td>{sc.stage === "Disposed" ? "Disposed" : sc.hearing ? fmtDate(sc.hearing) : "Not entered"}</td>
+                <td><Btn onClick={() => setSubOpen(sc)}>Edit</Btn><Btn onClick={() => setSubs(subs.filter((x2) => x2.id !== sc.id))}>Remove</Btn></td>
+              </tr>))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="quick" style={{ marginBottom: 14 }}>
+        <Btn kind="brass" onClick={() => setSubOpen("new")}>Add sub case</Btn>
+      </div>
+      {subOpen && (
+        <SubCaseForm db={db} user={user} commit={commit} flash={flash}
+          c={{ caseNo: f.caseNo || "this case", type: f.type, petitioner: f.petitioner, respondent: f.respondent,
+               order: "", stage: f.stage, nextHearing: f.nextHearing,
+               morePetitioners: f.morePetitioners, moreRespondents: f.moreRespondents }}
+          sub={subOpen === "new" ? null : subOpen}
+          onLocal={(sc) => { setSubs(subOpen === "new" ? [...subs, sc] : subs.map((x2) => (x2.id === sc.id ? sc : x2))); setSubOpen(null); }}
+          onClose={() => setSubOpen(null)} />
+      )}
       <Field label="Case history (optional)" hint="Background of the matter — saved as the first entry in the case history.">
         <textarea rows={3} value={history} onChange={(e) => setHistory(e.target.value)} placeholder="How the dispute arose, proceedings so far, key dates…" />
       </Field>
@@ -2513,8 +2572,12 @@ function CalendarView({ db, user, go }) {
 
   const events = (date) => {
     const out = [];
-    db.cases.filter((c) => c.nextHearing === date && (isOwner || c.associate === user.id))
+    const seesCases = isOwner || user.role === "Legal Associate";
+    db.cases.filter((c) => c.nextHearing === date && c.stage !== "Disposed" && (seesCases || c.associate === user.id))
       .forEach((c) => out.push({ t: "hearing", label: c.caseNo, id: c.id, kind: "case" }));
+    db.cases.filter((c) => seesCases || c.associate === user.id).forEach((c) =>
+      (c.subcases || []).filter((s0) => s0.hearing === date && s0.stage !== "Disposed")
+        .forEach((s0) => out.push({ t: "hearing", label: `${s0.caseNo} (sub of ${c.caseNo})`, id: c.id, kind: "case" })));
     db.tasks.filter((x) => x.due === date && x.status !== "Completed" && (isOwner || mineTask(x, user.id)))
       .forEach((x) => out.push({ t: "task", label: x.ref, id: x.id, kind: "task" }));
     db.leaves.filter((l) => l.status === "Approved" && l.from <= date && l.to >= date && (isOwner || l.userId === user.id))
