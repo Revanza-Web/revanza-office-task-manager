@@ -47,12 +47,51 @@ const stripKeys = (obj, keys) => {
   return o;
 };
 
+export async function sbUpload(dataUrl, name = "file.bin") {
+  const m = /^data:([^;]+);base64,(.*)$/.exec(String(dataUrl || ""));
+  if (!m || !supabase) return null;
+  const bytes = Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0));
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${(name || "file").replace(/[^a-zA-Z0-9_.-]/g, "")}`;
+  const { error } = await supabase.storage.from("rotm").upload(path, bytes.buffer, { contentType: m[1], upsert: false });
+  if (error) throw error;
+  const { data } = supabase.storage.from("rotm").getPublicUrl(path);
+  return data && data.publicUrl;
+}
+
+let lastSyncAt = null;
+export function markSynced() { lastSyncAt = new Date().toISOString(); }
+
+/* Incremental refresh: only rows changed since the last check.
+   Small always-whole tables (masters, locations, settings) are re-read fully. */
+export async function fetchDelta() {
+  if (!supabase || !lastSyncAt) return null;
+  const since = lastSyncAt;
+  lastSyncAt = new Date().toISOString();
+  const qd = (t) => supabase.from(t).select("*").gt("updated_at", since).then((r) => r.data || []);
+  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt, co] = await Promise.all([
+    qd("profiles"), qd("payroll"), qd("tasks"), qd("cases"), qd("attendance"), qd("leaves"),
+    supabase.from("masters").select("*").then((r) => r.data || []),
+    supabase.from("locations").select("*").then((r) => r.data || []),
+    supabase.from("app_settings").select("*").then((r) => r.data || []),
+    qd("audit"), qd("notifications"), qd("bank_accounts"), qd("acct_entries"),
+    qd("projects"), qd("ptasks"), qd("companies"),
+  ]);
+  return {
+    changed: { profiles: pr, payroll: pay, tasks: tk, cases: cs, attendance: at, leaves: lv,
+      audit: au, notifications: nf, accounts: ba, entries: ae, projects: pj, ptasks: pt, companies: co },
+    masters: Object.fromEntries(ms.map((r) => [r.key, r.items])),
+    locations: lc.map((r) => r.data),
+    settings: (st[0] && st[0].data) || null,
+  };
+}
+
 export async function fetchAll() {
   const q = (t, mod) => {
     let s = supabase.from(t).select("*");
     if (mod) s = mod(s);
     return s.then((r) => r.data || []);
   };
+  markSynced();
   const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt, co] = await Promise.all([
     q("profiles"), q("payroll"), q("tasks"), q("cases"), q("attendance"), q("leaves"),
     q("masters"), q("locations"), q("app_settings"),
@@ -158,8 +197,10 @@ export async function syncDB(prev, next, meRole) {
     jobs.push(supabase.from("audit").insert({ by_name: a.by, action: a.action, detail: a.detail }));
   }
   const results = await Promise.allSettled(jobs);
+  const errs = [];
   results.forEach((r) => {
-    if (r.status === "fulfilled" && r.value && r.value.error) console.error("sync:", r.value.error.message);
-    if (r.status === "rejected") console.error("sync:", r.reason);
+    if (r.status === "fulfilled" && r.value && r.value.error) { console.error("sync:", r.value.error.message); errs.push(r.value.error.message); }
+    if (r.status === "rejected") { console.error("sync:", r.reason); errs.push(String((r.reason && r.reason.message) || r.reason)); }
   });
+  return errs;
 }
