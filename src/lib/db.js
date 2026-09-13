@@ -68,17 +68,17 @@ export async function fetchDelta() {
   const since = lastSyncAt;
   lastSyncAt = new Date().toISOString();
   const qd = (t) => supabase.from(t).select("*").gt("updated_at", since).then((r) => r.data || []);
-  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt, co] = await Promise.all([
+  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt, co, ex] = await Promise.all([
     qd("profiles"), qd("payroll"), qd("tasks"), qd("cases"), qd("attendance"), qd("leaves"),
     supabase.from("masters").select("*").then((r) => r.data || []),
     supabase.from("locations").select("*").then((r) => r.data || []),
     supabase.from("app_settings").select("*").then((r) => r.data || []),
     qd("audit"), qd("notifications"), qd("bank_accounts"), qd("acct_entries"),
-    qd("projects"), qd("ptasks"), qd("companies"),
+    qd("projects"), qd("ptasks"), qd("companies"), qd("expenses"),
   ]);
   return {
     changed: { profiles: pr, payroll: pay, tasks: tk, cases: cs, attendance: at, leaves: lv,
-      audit: au, notifications: nf, accounts: ba, entries: ae, projects: pj, ptasks: pt, companies: co },
+      audit: au, notifications: nf, accounts: ba, entries: ae, projects: pj, ptasks: pt, companies: co, expenses: ex },
     masters: Object.fromEntries(ms.map((r) => [r.key, r.items])),
     locations: lc.map((r) => r.data),
     settings: (st[0] && st[0].data) || null,
@@ -92,13 +92,13 @@ export async function fetchAll() {
     return s.then((r) => r.data || []);
   };
   markSynced();
-  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt, co] = await Promise.all([
+  const [pr, pay, tk, cs, at, lv, ms, lc, st, au, nf, ba, ae, pj, pt, co, ex] = await Promise.all([
     q("profiles"), q("payroll"), q("tasks"), q("cases"), q("attendance"), q("leaves"),
     q("masters"), q("locations"), q("app_settings"),
     q("audit", (s) => s.order("ts", { ascending: false }).limit(300)),
     q("notifications", (s) => s.order("ts", { ascending: false }).limit(200)),
     q("bank_accounts"), q("acct_entries"),
-    q("projects"), q("ptasks"), q("companies"),
+    q("projects"), q("ptasks"), q("companies"), q("expenses"),
   ]);
   const payMap = Object.fromEntries(pay.map((p) => [p.profile_id, p.data || {}]));
   const users = pr.map((r) => ({
@@ -129,6 +129,7 @@ export async function fetchAll() {
     projects: pj.map((r) => r.data),
     ptasks: pt.map((r) => r.data),
     companies: co.map((r) => r.data),
+    expenses: ex.map((r) => r.data),
   };
 }
 
@@ -149,6 +150,7 @@ const rowBuilders = {
   notifications: (n) => ["notifications", { id: n.id, profile_id: n.userId, text: n.text, kind: n.kind, ref: n.ref, read: n.read }],
   accounts: (a) => ["bank_accounts", { id: a.id, data: a }],
   entries: (e) => ["acct_entries", { id: e.id, account_id: e.accountId, data: e }],
+  expenses: (e2) => ["expenses", { id: e2.id, data: e2 }],
   projects: (p) => ["projects", { id: p.id, team: p.team || [], contractors: p.contractors || [], data: p }],
   ptasks: (p) => ["ptasks", { id: p.id, project_id: p.projectId, assignees: p.assignees || [], data: p }],
   companies: (c) => ["companies", { id: c.id, data: c }],
