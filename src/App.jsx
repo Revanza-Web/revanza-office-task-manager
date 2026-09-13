@@ -614,7 +614,7 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
-const APP_VERSION = "v3.1 · 29 Aug 2026";
+const APP_VERSION = "v3.3 · 29 Aug 2026";
 const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 /* In-app webcam window: live preview → capture → JPEG. Used as the primary
@@ -3983,46 +3983,152 @@ function PTaskModal({ task, proj, db, user, commit, flash, canBuild, onClose }) 
 
 /* ============================ EXPENSES ============================ */
 const EXP_CATS = ["Material", "Labour", "Transport", "Water", "Electrical", "Plumbing", "Machinery", "Site office", "Misc"];
+/* The accounts team names scans "2026.06.02 BHAVAN WATER SUPPLY.pdf" — the
+   filename is the most reliable source of the bill's date and vendor. */
+const fnDate = (title) => {
+  const m = /^\s*(\d{4})[.\-_](\d{2})[.\-_](\d{2})/.exec(String(title || ""));
+  if (!m) return null;
+  const d0 = `${m[1]}-${m[2]}-${m[3]}`;
+  return isNaN(new Date(d0).getTime()) ? null : d0;
+};
+const fnVendor = (title) => titleCase(String(title || "")
+  .replace(/^\s*\d{4}[.\-_]\d{2}[.\-_]\d{2}\s*/, "")
+  .replace(/\.(pdf|jpe?g|png|heic|webp)$/i, "")
+  .replace(/[_]+/g, " ").trim());
+const DEFAULT_EXP_FOLDERS = [
+  { project: "Central", folderId: "1gid3SJmrPN2FqNMd2s4l5G_cfucpsKXB" },
+  { project: "Mahindra World City", folderId: "14WULmVPW6_urMRg_Fa_jeXs8oLysfEaz" },
+  { project: "T Nagar", folderId: "1J6sDsaOtFoSlyhln6c9uva8_Hm3d_YYK" },
+];
+async function driveList(folderId, key) {
+  const u = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${folderId}' in parents and trashed=false`)}&fields=${encodeURIComponent("files(id,name,mimeType,webViewLink)")}&pageSize=1000&key=${encodeURIComponent(key)}`;
+  const r = await fetch(u);
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    throw new Error((body.error && body.error.message) || `Drive answered ${r.status}`);
+  }
+  return (await r.json()).files || [];
+}
+const payStatus = (e) => {
+  const amt = Number(e.amount) || 0, paid = Number(e.paidAmount) || 0;
+  return paid >= amt - 0.005 && amt > 0 ? "Paid" : paid > 0 ? "Part paid" : "Unpaid";
+};
 
 function Expenses({ db, user, commit, flash }) {
   const t = today();
   const [proj, setProj] = useState("");
   const [cat, setCat] = useState("");
-  const [month, setMonth] = useState(t.slice(0, 7));
+  const [month, setMonth] = useState("");
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [paying, setPaying] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [cfg, setCfg] = useState(false);
   const list = db.expenses || [];
+  const expSync = (db.settings && db.settings.expSync) || { key: "", folders: DEFAULT_EXP_FOLDERS };
+  const runSync = async () => {
+    if (!expSync.key) { setCfg(true); return flash("First save a Google API key in the sync settings — one-time setup"); }
+    setSyncing(true);
+    let found = 0, added = 0, failed = null;
+    try {
+      for (const pf of expSync.folders.filter((x) => x.project && x.folderId)) {
+        const queue = [{ id: pf.folderId, name: "", depth: 0 }];
+        const seen = {};
+        const filesAll = [];
+        while (queue.length && filesAll.length < 400) {
+          const f0 = queue.shift();
+          if (seen[f0.id]) continue;
+          seen[f0.id] = true;
+          const items = await driveList(f0.id, expSync.key);
+          for (const it of items) {
+            if ((it.mimeType || "").includes("folder")) {
+              if (f0.depth < 3) queue.push({ id: it.id, name: String(it.name || "").trim(), depth: f0.depth + 1 });
+            } else if ((it.mimeType || "").includes("spreadsheet") && /register/i.test(it.name || "")) {
+              /* the project's own register sheet, not a bill */
+            } else {
+              filesAll.push({ id: it.id, name: it.name, link: it.webViewLink, cat: f0.name });
+            }
+          }
+        }
+        found += filesAll.length;
+        commit((d) => {
+          ["expProjects", "vendors", "expCategories"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
+          filesAll.forEach((fl) => {
+            if (d.expenses.some((e) => e.driveId === fl.id)) return;
+            const byName = d.expenses.find((e) => e.project === pf.project && (e.fileName || "") === fl.name);
+            if (byName) { byName.driveId = fl.id; if (!byName.bill) byName.bill = fl.link; return; }
+            const vend = fnVendor(fl.name);
+            learn(d, "expProjects", pf.project); learn(d, "vendors", vend); learn(d, "expCategories", fl.cat || "");
+            d.expenses.push({
+              id: uid("ex"), driveId: fl.id, date: fnDate(fl.name) || today(), project: pf.project,
+              vendor: vend, desc: "", category: fl.cat || "", amount: 0, gst: 0, paidAmount: 0, payments: [],
+              query: "", fileName: fl.name, bill: fl.link, source: "Drive sync", by: user.name, ts: Date.now(),
+            });
+            added++;
+          });
+        }, added ? { by: user.name, action: "Bills synced from Drive", detail: `${pf.project}` } : null);
+      }
+      flash(`Drive sync done — ${found} file(s) seen, ${added} new bill(s) added. Amounts for new bills: tap "Set amount", or ask Claude to "check the bills folders" and paste the block to fill them in bulk.`);
+    } catch (e2) {
+      failed = e2.message || String(e2);
+      flash("Drive sync failed: " + failed + (/(API key|forbidden|permission|403)/i.test(failed) ? " — check the API key, and that the folders are shared as 'Anyone with the link — Viewer'" : ""));
+    }
+    setSyncing(false);
+  };
   const projNames = [...new Set(["Central", "Mahindra World City", "T Nagar",
     ...(db.projects || []).map((p) => p.name), ...(db.masters.expProjects || []), ...list.map((e) => e.project)])].filter(Boolean);
   const rows = list
     .filter((e) => (!proj || e.project === proj) && (!cat || e.category === cat) && (!month || (e.date || "").slice(0, 7) === month))
     .sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.ts || 0) - (a.ts || 0));
-  const total = rows.reduce((a, e) => a + (Number(e.amount) || 0), 0);
-  const byProj = {}; const byCat = {};
+  const totalBills = rows.reduce((a, e) => a + (Number(e.amount) || 0), 0);
+  const totalPaid = rows.reduce((a, e) => a + Math.min(Number(e.paidAmount) || 0, Number(e.amount) || 0), 0);
+  const pending = totalBills - totalPaid;
+  const doubtful = rows.filter((e) => e.query);
+  const doubtfulAmt = doubtful.reduce((a, e) => a + (Number(e.amount) || 0), 0);
+  const gstTotal = rows.reduce((a, e) => a + (Number(e.gst) || 0), 0);
+  const settled = totalBills > 0 ? Math.round((totalPaid / totalBills) * 100) : 0;
+  const byProj = {};
+  rows.forEach((e) => { byProj[e.project] = (byProj[e.project] || 0) + (Number(e.amount) || 0); });
+  const vendorPending = {};
   rows.forEach((e) => {
-    byProj[e.project] = (byProj[e.project] || 0) + (Number(e.amount) || 0);
-    byCat[e.category || "—"] = (byCat[e.category || "—"] || 0) + (Number(e.amount) || 0);
+    const due = (Number(e.amount) || 0) - Math.min(Number(e.paidAmount) || 0, Number(e.amount) || 0);
+    if (due > 0.005) vendorPending[e.vendor || "(no vendor)"] = (vendorPending[e.vendor || "(no vendor)"] || 0) + due;
   });
   const del = (e) => {
-    if (!window.confirm(`Delete this expense of ${inr(e.amount)} (${e.vendor || e.desc || "no name"})?`)) return;
+    if (!window.confirm(`Delete this bill of ${inr(e.amount)} (${e.vendor || e.desc || "no name"})?`)) return;
     commit((d) => { d.expenses = d.expenses.filter((x) => x.id !== e.id); },
       { by: user.name, action: "Expense deleted", detail: `${e.project} · ${inr(e.amount)}` });
     flash("Expense deleted");
   };
+  const raiseQuery = (e) => {
+    const q = window.prompt(e.query ? "Update the query on this bill (empty to clear it):" : "What is wrong or doubtful about this bill?", e.query || "");
+    if (q === null) return;
+    commit((d) => {
+      const x = d.expenses.find((y) => y.id === e.id);
+      x.query = q.trim();
+      if (q.trim()) pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id].filter((id) => id !== user.id),
+        `Bill query — ${e.project} · ${e.vendor || ""} ${inr(e.amount)}: ${q.trim().slice(0, 80)}`, "Expense query", null);
+    }, { by: user.name, action: q.trim() ? "Bill query raised" : "Bill query cleared", detail: `${e.project} · ${e.vendor || ""} · ${inr(e.amount)}` });
+    flash(q.trim() ? "Query recorded on the bill" : "Query cleared");
+  };
   const dl = () => downloadCSV(`expenses-${month || "all"}.csv`,
-    [["Date", "Project", "Vendor", "Description", "Category", "Amount", "Bill"],
-    ...rows.map((e) => [e.date, e.project, e.vendor || "", e.desc || "", e.category || "", e.amount, e.bill ? "on record" : (e.fileName || "")]),
-    [], ["Total", "", "", "", "", total, ""]],
+    [["Date", "Project", "Vendor", "Description", "Category", "Bill amount", "GST", "Paid", "Pending", "Status", "Query", "Bill file"],
+    ...rows.map((e) => [e.date, e.project, e.vendor || "", e.desc || "", e.category || "", e.amount, e.gst || "",
+      e.paidAmount || 0, (Number(e.amount) || 0) - Math.min(Number(e.paidAmount) || 0, Number(e.amount) || 0), payStatus(e), e.query || "", e.bill ? "on record" : (e.fileName || "")]),
+    [], ["Totals", "", "", "", "", totalBills, gstTotal, totalPaid, pending, `${settled}% settled`, "", ""]],
     [`Revanza — Site expenses ${month || "(all months)"}${proj ? " · " + proj : ""}`,
     `Generated ${new Date().toLocaleString("en-GB")} by ${user.name}`, "Confidential — internal circulation only"]);
   return (
     <>
       <div className="grid">
-        <Stat n={inr(total)} label={`Total (${month || "all"}${proj ? " · " + proj : ""})`} t="orange" />
-        {Object.entries(byProj).slice(0, 3).map(([k, v]) => <Stat key={k} n={inr(v)} label={k} t="blue" />)}
+        <Stat n={inr(totalBills)} label="Total value of bills" t="blue" />
+        <Stat n={inr(totalPaid)} label={`Payment paid (${settled}% settled)`} t="green" />
+        <Stat n={inr(pending)} label="Payment pending" t="orange" />
+        <Stat n={doubtful.length ? `${doubtful.length} · ${inr(doubtfulAmt)}` : "0"} label="Wrong or doubtful claims" t={doubtful.length ? "red" : "grey"} />
       </div>
-      <Panel title="Site expenses" sub="Bills across projects — added by hand, or imported from the Drive bills folders via a paste."
-        right={<><Btn onClick={() => setImporting(true)}>Import from Drive check</Btn><Btn onClick={dl}>Download CSV</Btn><Btn kind="solid" onClick={() => setAdding(true)}>Add expense</Btn></>}>
+      <Panel title="Site expenses — bills, payments and claims"
+        sub={`${rows.length} bill(s) · ${Object.keys(vendorPending).length} vendor(s) with pending payment · GST / input credit ${inr(gstTotal)}`}
+        right={<><Btn kind="brass" disabled={syncing} onClick={runSync}>{syncing ? "Syncing…" : "Sync from Drive"}</Btn><Btn onClick={() => setCfg(true)}>Sync settings</Btn><Btn onClick={() => setImporting(true)}>Import amounts</Btn><Btn onClick={dl}>Download CSV</Btn><Btn kind="solid" onClick={() => setAdding(true)}>Add bill</Btn></>}>
         <div className="filters">
           <select value={proj} onChange={(e) => setProj(e.target.value)}>
             <option value="">All projects</option>{projNames.map((x) => <option key={x}>{x}</option>)}
@@ -4031,25 +4137,47 @@ function Expenses({ db, user, commit, flash }) {
             <option value="">All categories</option>{[...new Set([...EXP_CATS, ...(db.masters.expCategories || [])])].map((x) => <option key={x}>{x}</option>)}
           </select>
           <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
-          {month && <Btn onClick={() => setMonth("")}>All months</Btn>}
+          {(proj || cat || month) && <Btn onClick={() => { setProj(""); setCat(""); setMonth(""); }}>Clear filters</Btn>}
         </div>
-        {Object.keys(byCat).length > 1 && (
-          <p className="fhint">By category: {Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${inr(v)}`).join(" · ")}</p>
+        {Object.keys(byProj).length > 1 && (
+          <p className="fhint">By project: {Object.entries(byProj).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${inr(v)}`).join(" · ")}</p>
         )}
-        {rows.length === 0 ? <Empty>No expenses for this view — add one or run an import.</Empty> : (
+        {Object.keys(vendorPending).length > 0 && (
+          <p className="fhint"><b>Vendor-wise payable:</b> {Object.entries(vendorPending).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k} ${inr(v)}`).join(" · ")}</p>
+        )}
+        {rows.length === 0 ? <Empty>No bills in this view — add one, or run an import from the Drive folders.</Empty> : (
           <div className="scroll-x">
             <table className="tbl">
-              <thead><tr><th>Date</th><th>Project</th><th>Vendor / description</th><th>Category</th><th className="amt">Amount</th><th>Bill</th><th></th></tr></thead>
-              <tbody>{rows.map((e) => (
-                <tr key={e.id}>
-                  <td>{fmtDate(e.date)}</td>
-                  <td>{e.project}</td>
-                  <td><b>{e.vendor || "—"}</b>{e.desc && <i className="sub">{e.desc.slice(0, 60)}</i>}</td>
-                  <td>{e.category || "—"}</td>
-                  <td className="amt">{inr(e.amount)}</td>
-                  <td>{e.bill ? <a href={e.bill} target="_blank" rel="noreferrer">View</a> : e.fileName ? <span className="muted" title={"In the Drive folder: " + e.fileName}>{String(e.fileName).slice(0, 18)}…</span> : "—"}</td>
-                  <td>{user.role === OWNER && <Btn onClick={() => del(e)}>Delete</Btn>}</td>
-                </tr>))}
+              <thead><tr><th>Date</th><th>Project</th><th>Vendor / description</th><th>Category</th><th className="amt">Bill</th><th className="amt">Paid</th><th>Status</th><th>Bill file</th><th></th></tr></thead>
+              <tbody>{rows.map((e) => {
+                const st = payStatus(e);
+                return (
+                  <tr key={e.id} className={e.query ? "row-danger" : ""}>
+                    <td>{fmtDate(e.date)}</td>
+                    <td>{e.project}</td>
+                    <td><b>{e.vendor || "—"}</b>{e.desc && <i className="sub">{e.desc.slice(0, 55)}</i>}{e.query && <i className="sub danger">⚑ {e.query.slice(0, 55)}</i>}</td>
+                    <td>{e.category || "—"}</td>
+                    <td className="amt">{Number(e.amount) > 0 ? <>{inr(e.amount)}{Number(e.gst) > 0 && <i className="sub">GST {inr(e.gst)}</i>}</> : (
+                      <Btn onClick={() => {
+                        const a = window.prompt(`Bill amount for ${e.vendor || e.fileName}? (₹)`);
+                        if (a === null) return;
+                        const n = parseAmt(a);
+                        if (!n) return flash("Enter a number");
+                        commit((d) => { const x = d.expenses.find((y) => y.id === e.id); x.amount = n; },
+                          { by: user.name, action: "Bill amount set", detail: `${e.project} · ${e.vendor || e.fileName} · ${inr(n)}` });
+                      }}>Set amount</Btn>
+                    )}</td>
+                    <td className="amt">{inr(e.paidAmount || 0)}</td>
+                    <td><Badge t={st === "Paid" ? "green" : st === "Part paid" ? "blue" : "orange"}>{st}</Badge></td>
+                    <td>{e.bill ? <a href={e.bill} target="_blank" rel="noreferrer">View</a> : e.fileName ? <span className="muted" title={"In the Drive folder: " + e.fileName}>{String(e.fileName).slice(0, 16)}…</span> : "—"}</td>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      {st !== "Paid" && <Btn onClick={() => setPaying(e.id)}>Record payment</Btn>}
+                      <Btn onClick={() => raiseQuery(e)}>{e.query ? "Query ⚑" : "Query"}</Btn>
+                      {user.role === OWNER && <Btn onClick={() => del(e)}>Delete</Btn>}
+                    </td>
+                  </tr>
+                );
+              })}
               </tbody>
             </table>
           </div>
@@ -4057,12 +4185,80 @@ function Expenses({ db, user, commit, flash }) {
       </Panel>
       {adding && <ExpenseForm db={db} user={user} commit={commit} flash={flash} projNames={projNames} onClose={() => setAdding(false)} />}
       {importing && <ExpenseImport db={db} user={user} commit={commit} flash={flash} onClose={() => setImporting(false)} />}
+      {paying && <PaymentModal e={list.find((x) => x.id === paying)} db={db} user={user} commit={commit} flash={flash} onClose={() => setPaying(null)} />}
+      {cfg && <DriveSyncSettings db={db} user={user} commit={commit} flash={flash} expSync={expSync} onClose={() => setCfg(false)} />}
     </>
   );
 }
 
+function DriveSyncSettings({ db, user, commit, flash, expSync, onClose }) {
+  const [key, setKey] = useState(expSync.key || "");
+  const [folders, setFolders] = useState(expSync.folders && expSync.folders.length ? expSync.folders : DEFAULT_EXP_FOLDERS);
+  const save = () => {
+    commit((d) => { d.settings.expSync = { key: key.trim(), folders: folders.filter((x) => x.project.trim() && x.folderId.trim()) }; },
+      { by: user.name, action: "Drive sync settings saved", detail: `${folders.length} folder(s)` });
+    flash("Sync settings saved — press Sync from Drive"); onClose();
+  };
+  return (
+    <Modal title="Drive sync settings" onClose={onClose} wide>
+      <p className="fhint">One-time setup: 1) In console.cloud.google.com create a project → enable the <b>Google Drive API</b> → Credentials → <b>Create API key</b>, and paste it below. 2) Each bills folder in Drive must be shared as <b>"Anyone with the link — Viewer"</b> (folder → Share → General access). The app then reads the folder listings directly — subfolder names become categories, and dates and vendors come from the file names.</p>
+      <Field label="Google API key"><input value={key} onChange={(e) => setKey(e.target.value)} placeholder="AIza…" /></Field>
+      <h4>Bills folders</h4>
+      {folders.map((f0, i) => (
+        <div className="row2" key={i}>
+          <Field label={`Project ${i + 1}`}><input value={f0.project} onChange={(e) => setFolders(folders.map((y, j) => j === i ? { ...y, project: e.target.value } : y))} /></Field>
+          <Field label="Drive folder ID" hint="From the folder's link: drive.google.com/drive/folders/THIS-PART"><input value={f0.folderId} onChange={(e) => setFolders(folders.map((y, j) => j === i ? { ...y, folderId: e.target.value } : y))} /></Field>
+        </div>
+      ))}
+      <div className="quick" style={{ marginBottom: 14 }}>
+        <Btn onClick={() => setFolders([...folders, { project: "", folderId: "" }])}>Add a folder</Btn>
+        {folders.length > 1 && <Btn onClick={() => setFolders(folders.slice(0, -1))}>Remove last</Btn>}
+      </div>
+      <Btn kind="solid" full onClick={save}>Save settings</Btn>
+    </Modal>
+  );
+}
+
+function PaymentModal({ e, db, user, commit, flash, onClose }) {
+  const due = (Number(e.amount) || 0) - (Number(e.paidAmount) || 0);
+  const [amt, setAmt] = useState(due > 0 ? String(due) : "");
+  const [date, setDate] = useState(today());
+  const save = () => {
+    const a = parseAmt(amt);
+    if (!a) return flash("Enter the amount paid");
+    commit((d) => {
+      const x = d.expenses.find((y) => y.id === e.id);
+      x.payments = x.payments || [];
+      x.payments.push({ date, amt: a, by: user.name, ts: Date.now() });
+      x.paidAmount = (Number(x.paidAmount) || 0) + a;
+      pushNotify(d, [d.users.find((u2) => u2.role === OWNER)?.id].filter((id) => id !== user.id),
+        `Payment ${inr(a)} recorded on ${e.vendor || e.project} bill of ${inr(e.amount)} (${payStatus(x)})`, "Expense payment", null);
+    }, { by: user.name, action: "Bill payment recorded", detail: `${e.project} · ${e.vendor || ""} · ${inr(a)}` });
+    flash(`Payment of ${inr(a)} recorded`); onClose();
+  };
+  return (
+    <Modal title={`Record payment — ${e.vendor || e.project}`} onClose={onClose}>
+      <div className="kv">
+        <div><span>Bill amount</span><b>{inr(e.amount)}</b></div>
+        <div><span>Paid so far</span><b>{inr(e.paidAmount || 0)}</b></div>
+        <div><span>Pending</span><b>{inr(due)}</b></div>
+      </div>
+      {(e.payments || []).length > 0 && (
+        <ul className="feed">{e.payments.map((p2, i) => (
+          <li key={i}><span className="feed-m">{fmtDate(p2.date)} · {p2.by}</span>{inr(p2.amt)}</li>))}
+        </ul>
+      )}
+      <div className="row2">
+        <Field label="Amount paid now (₹)"><input type="number" value={amt} onChange={(ev) => setAmt(ev.target.value)} /></Field>
+        <Field label="Payment date"><input type="date" value={date} onChange={(ev) => setDate(ev.target.value)} /></Field>
+      </div>
+      <Btn kind="solid" full onClick={save}>Record payment</Btn>
+    </Modal>
+  );
+}
+
 function ExpenseForm({ db, user, commit, flash, projNames, onClose }) {
-  const [f, setF] = useState({ project: projNames[0] || "", date: today(), vendor: "", desc: "", category: "Material", amount: "", bill: "" });
+  const [f, setF] = useState({ project: projNames[0] || "", date: today(), vendor: "", desc: "", category: "Material", amount: "", gst: "", paidAmount: "", bill: "" });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const onBill = async (e) => {
     const fl = e.target.files[0];
@@ -4080,16 +4276,20 @@ function ExpenseForm({ db, user, commit, flash, projNames, onClose }) {
     flash("Bill attached");
   };
   const save = () => {
-    if (!f.project.trim() || !f.date || !Number(f.amount)) return flash("Project, date and amount are required");
+    if (!f.project.trim() || !f.date || !Number(f.amount)) return flash("Project, date and bill amount are required");
     commit((d) => {
       ["expProjects", "vendors", "expCategories"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
       learn(d, "expProjects", f.project); learn(d, "vendors", f.vendor); learn(d, "expCategories", f.category);
-      d.expenses.push({ ...f, amount: Number(f.amount), id: uid("ex"), source: "Manual", by: user.name, ts: Date.now() });
-    }, { by: user.name, action: "Expense added", detail: `${f.project} · ${f.vendor || f.desc} · ${inr(Number(f.amount))}` });
-    flash("Expense recorded"); onClose();
+      d.expenses.push({
+        ...f, amount: Number(f.amount), gst: parseAmt(f.gst), paidAmount: parseAmt(f.paidAmount),
+        payments: parseAmt(f.paidAmount) ? [{ date: f.date, amt: parseAmt(f.paidAmount), by: user.name, ts: Date.now() }] : [],
+        id: uid("ex"), source: "Manual", by: user.name, ts: Date.now(),
+      });
+    }, { by: user.name, action: "Bill added", detail: `${f.project} · ${f.vendor || f.desc} · ${inr(Number(f.amount))}` });
+    flash("Bill recorded"); onClose();
   };
   return (
-    <Modal title="Add expense" onClose={onClose} wide>
+    <Modal title="Add bill" onClose={onClose} wide>
       <div className="row2">
         <SmartSelect label="Project" value={f.project} onChange={(v) => setF({ ...f, project: v })} options={projNames} />
         <Field label="Bill date"><input type="date" value={f.date} onChange={set("date")} /></Field>
@@ -4100,9 +4300,13 @@ function ExpenseForm({ db, user, commit, flash, projNames, onClose }) {
           options={[...new Set([...EXP_CATS, ...(db.masters.expCategories || [])])]} />
       </div>
       <Field label="Description (optional)"><input value={f.desc} onChange={set("desc")} placeholder="e.g. 40 bags cement · challan 118" /></Field>
-      <Field label="Amount (₹)"><input type="number" value={f.amount} onChange={set("amount")} /></Field>
+      <div className="row2">
+        <Field label="Bill amount (₹)"><input type="number" value={f.amount} onChange={set("amount")} /></Field>
+        <Field label="GST in the bill (₹, optional)"><input type="number" value={f.gst} onChange={set("gst")} /></Field>
+      </div>
+      <Field label="Already paid (₹, optional)" hint="If part or full payment is already made, enter it — further payments can be recorded on the bill later."><input type="number" value={f.paidAmount} onChange={set("paidAmount")} /></Field>
       <Field label="Bill copy (photo or PDF, up to 15 MB)"><input type="file" accept="image/*,application/pdf" onChange={onBill} />{f.bill && <p className="fhint">Bill attached ✓</p>}</Field>
-      <Btn kind="solid" full onClick={save}>Save expense</Btn>
+      <Btn kind="solid" full onClick={save}>Save bill</Btn>
     </Modal>
   );
 }
@@ -4117,11 +4321,12 @@ function ExpenseImport({ db, user, commit, flash, onClose }) {
       if (rows.length > 1) {
         const hdr = rows[0].map((h) => String(h || "").toLowerCase().trim());
         const ix = (n) => hdr.indexOf(n);
+        const g = (r, n) => (ix(n) >= 0 ? r[ix(n)] : "");
         items = rows.slice(1).filter((r) => r.some((c) => String(c).trim())).map((r) => ({
-          date: r[ix("date")], project: r[ix("project")], vendor: ix("vendor") >= 0 ? r[ix("vendor")] : "",
-          desc: ix("description") >= 0 ? r[ix("description")] : (ix("desc") >= 0 ? r[ix("desc")] : ""),
-          category: ix("category") >= 0 ? r[ix("category")] : "",
-          amount: parseAmt(r[ix("amount")]), fileName: ix("file") >= 0 ? r[ix("file")] : "",
+          date: g(r, "date"), project: g(r, "project"), vendor: g(r, "vendor"),
+          desc: g(r, "description") || g(r, "desc"), category: g(r, "category"),
+          amount: parseAmt(g(r, "amount")), gst: parseAmt(g(r, "gst")),
+          paid: parseAmt(g(r, "paid")), query: g(r, "query"), fileName: g(r, "file"),
         }));
       }
     }
@@ -4129,29 +4334,41 @@ function ExpenseImport({ db, user, commit, flash, onClose }) {
   };
   const doImport = () => {
     const items = parse();
-    if (!items || !items.length) return flash("Nothing readable — paste the import block exactly as given, or a CSV with date, project, vendor, description, category, amount columns");
-    let added = 0, skipped = 0;
+    if (!items || !items.length) return flash("Nothing readable — paste the import block exactly as given, or a CSV with date, project, vendor, description, category, amount (and optionally gst, paid, query, file) columns");
+    let added = 0, updated = 0, skipped = 0;
     commit((d) => {
       ["expProjects", "vendors", "expCategories"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
       items.forEach((x) => {
-        const dup = d.expenses.find((e) => e.project === x.project && e.date === x.date &&
-          Math.abs((Number(e.amount) || 0) - (Number(x.amount) || 0)) < 0.005 &&
-          (e.fileName || "") === (x.fileName || ""));
-        if (dup) { skipped++; return; }
+        const dup = (x.fileName && d.expenses.find((e) => e.project === x.project && (e.fileName || "") === x.fileName))
+          || d.expenses.find((e) => e.project === x.project && e.date === x.date &&
+            Math.abs((Number(e.amount) || 0) - (Number(x.amount) || 0)) < 0.005 &&
+            (e.fileName || "") === (x.fileName || ""));
+        if (dup) {
+          let ch = false;
+          if (Number(x.amount) > 0 && !(Number(dup.amount) > 0)) { dup.amount = Number(x.amount); ch = true; }
+          if (Number(x.gst) > 0 && !(Number(dup.gst) > 0)) { dup.gst = Number(x.gst); ch = true; }
+          if (x.vendor && !dup.vendor) { dup.vendor = x.vendor; ch = true; }
+          if (x.category && !dup.category) { dup.category = x.category; ch = true; }
+          if (Number(x.paid) > (Number(dup.paidAmount) || 0)) { dup.paidAmount = Number(x.paid); ch = true; }
+          if (x.query && x.query !== dup.query) { dup.query = x.query; ch = true; }
+          if (ch) updated++; else skipped++;
+          return;
+        }
         learn(d, "expProjects", x.project); learn(d, "vendors", x.vendor || ""); learn(d, "expCategories", x.category || "");
         d.expenses.push({ id: uid("ex"), date: x.date, project: x.project, vendor: x.vendor || "", desc: x.desc || "",
-          category: x.category || "", amount: Number(x.amount), fileName: x.fileName || "", bill: x.bill || "",
-          source: "Drive import", by: user.name, ts: Date.now() });
+          category: x.category || "", amount: Number(x.amount), gst: Number(x.gst) || 0,
+          paidAmount: Number(x.paid) || 0, payments: [], query: x.query || "",
+          fileName: x.fileName || "", bill: x.bill || "", source: "Drive import", by: user.name, ts: Date.now() });
         added++;
       });
-    }, { by: user.name, action: "Expenses imported", detail: `${added} added · ${skipped} duplicates skipped` });
-    flash(`${added} expense(s) imported · ${skipped} duplicate(s) skipped`);
+    }, { by: user.name, action: "Bills imported", detail: `${added} added · ${updated} updated · ${skipped} unchanged` });
+    flash(`${added} bill(s) imported · ${updated} updated (payments/queries) · ${skipped} unchanged`);
     onClose();
   };
   return (
-    <Modal title="Import expenses" onClose={onClose} wide>
-      <p className="fhint">Ask in Claude: "check the bills folders" — the reply contains an import block for the new bills in the Central, Mahindra World City and T Nagar Drive folders. Paste it here whole. A plain CSV with date, project, vendor, description, category, amount columns works too. Duplicates (same project, date, amount, file) are skipped automatically, so importing twice is harmless.</p>
-      <textarea rows={10} value={txt} onChange={(e) => setTxt(e.target.value)} placeholder='[{"date":"2026-08-26","project":"Central","vendor":"Bhavan Water Supply","desc":"Tanker 12kl","category":"Water","amount":4500,"fileName":"2026.08.26 BHAVAN WATER SUPPLY.pdf"}]' style={{ width: "100%", fontFamily: "monospace", fontSize: 12 }} />
+    <Modal title="Import bills" onClose={onClose} wide>
+      <p className="fhint">Ask in Claude: "check the bills folders" — the reply contains an import block for new bills in the Central, Mahindra World City and T Nagar Drive folders, with amounts, GST, payment status and queries where visible. Paste it whole. Re-importing is safe: existing bills are matched (same project, date, amount, file) and only their payment or query is updated, never duplicated.</p>
+      <textarea rows={10} value={txt} onChange={(e) => setTxt(e.target.value)} placeholder='[{"date":"2026-08-26","project":"Central","vendor":"Bhavan Water Supply","desc":"Tanker 12kl","category":"Water","amount":4500,"gst":0,"paid":4500,"fileName":"2026.08.26 BHAVAN WATER SUPPLY.pdf"}]' style={{ width: "100%", fontFamily: "monospace", fontSize: 12 }} />
       <Btn kind="solid" full onClick={doImport}>Import</Btn>
     </Modal>
   );
