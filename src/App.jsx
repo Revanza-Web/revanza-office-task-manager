@@ -51,6 +51,7 @@ const NAV = [
   { id: "dashboard", label: "Dashboard", roles: "*" },
   { id: "tasks", label: "Tasks", roles: "*" },
   { id: "projects", label: "Projects", roles: "*" },
+  { id: "expenses", label: "Expenses", roles: [OWNER, "Payments"] },
   { id: "attendance", label: "Attendance", roles: "*" },
   { id: "leave", label: "Leave", roles: "*" },
   { id: "cases", label: "Legal Cases", roles: [OWNER, "Legal Associate"] },
@@ -441,6 +442,7 @@ function seedDB() {
     projects: [],
     ptasks: [],
     companies: [],
+    expenses: [],
     audit: [{ ts: Date.now(), by: "system", action: "Workspace created", detail: "Seed users and sample records loaded" }],
     settings: { morningDue: "10:30", ownerEmail: "md@revanza.in" },
   };
@@ -612,7 +614,7 @@ function SmartSelect({ label, value, onChange, options, hint }) {
 }
 
 /* Opens the device camera (front camera on phones), compresses the shot */
-const APP_VERSION = "v3.0 · 28 Aug 2026";
+const APP_VERSION = "v3.1 · 29 Aug 2026";
 const IS_TOUCH_DEVICE = typeof navigator !== "undefined" && /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 /* In-app webcam window: live preview → capture → JPEG. Used as the primary
@@ -763,6 +765,8 @@ export default function App() {
       if (!d.settings.hr) d.settings.hr = { ...HR_DEFAULTS };
       if (!d.projects) d.projects = [];
       if (!d.ptasks) d.ptasks = [];
+      if (!d.companies) d.companies = [];
+      if (!d.expenses) d.expenses = [];
       setDb(d);
       try {
         const sv = localStorage.getItem(SESSION_KEY);
@@ -953,6 +957,7 @@ export default function App() {
             {view === "accounts" && <Accounts db={db} user={user} commit={commit} flash={flash} />}
             {view === "salary" && <Salary db={db} user={user} commit={commit} flash={flash} />}
             {view === "projects" && <Projects db={db} user={user} commit={commit} flash={flash} />}
+            {view === "expenses" && <Expenses db={db} user={user} commit={commit} flash={flash} />}
             {view === "directory" && <Directory db={db} user={user} commit={commit} flash={flash} />}
             {view === "reports" && <Reports db={db} user={user} />}
             {view === "audit" && <AuditLog db={db} />}
@@ -3972,6 +3977,182 @@ function PTaskModal({ task, proj, db, user, commit, flash, canBuild, onClose }) 
           <li key={i}><span className="feed-m">{u.by} · {fmtStamp(u.ts)}</span>{u.text}</li>))}
         </ul>
       )}
+    </Modal>
+  );
+}
+
+/* ============================ EXPENSES ============================ */
+const EXP_CATS = ["Material", "Labour", "Transport", "Water", "Electrical", "Plumbing", "Machinery", "Site office", "Misc"];
+
+function Expenses({ db, user, commit, flash }) {
+  const t = today();
+  const [proj, setProj] = useState("");
+  const [cat, setCat] = useState("");
+  const [month, setMonth] = useState(t.slice(0, 7));
+  const [adding, setAdding] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const list = db.expenses || [];
+  const projNames = [...new Set(["Central", "Mahindra World City", "T Nagar",
+    ...(db.projects || []).map((p) => p.name), ...(db.masters.expProjects || []), ...list.map((e) => e.project)])].filter(Boolean);
+  const rows = list
+    .filter((e) => (!proj || e.project === proj) && (!cat || e.category === cat) && (!month || (e.date || "").slice(0, 7) === month))
+    .sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.ts || 0) - (a.ts || 0));
+  const total = rows.reduce((a, e) => a + (Number(e.amount) || 0), 0);
+  const byProj = {}; const byCat = {};
+  rows.forEach((e) => {
+    byProj[e.project] = (byProj[e.project] || 0) + (Number(e.amount) || 0);
+    byCat[e.category || "—"] = (byCat[e.category || "—"] || 0) + (Number(e.amount) || 0);
+  });
+  const del = (e) => {
+    if (!window.confirm(`Delete this expense of ${inr(e.amount)} (${e.vendor || e.desc || "no name"})?`)) return;
+    commit((d) => { d.expenses = d.expenses.filter((x) => x.id !== e.id); },
+      { by: user.name, action: "Expense deleted", detail: `${e.project} · ${inr(e.amount)}` });
+    flash("Expense deleted");
+  };
+  const dl = () => downloadCSV(`expenses-${month || "all"}.csv`,
+    [["Date", "Project", "Vendor", "Description", "Category", "Amount", "Bill"],
+    ...rows.map((e) => [e.date, e.project, e.vendor || "", e.desc || "", e.category || "", e.amount, e.bill ? "on record" : (e.fileName || "")]),
+    [], ["Total", "", "", "", "", total, ""]],
+    [`Revanza — Site expenses ${month || "(all months)"}${proj ? " · " + proj : ""}`,
+    `Generated ${new Date().toLocaleString("en-GB")} by ${user.name}`, "Confidential — internal circulation only"]);
+  return (
+    <>
+      <div className="grid">
+        <Stat n={inr(total)} label={`Total (${month || "all"}${proj ? " · " + proj : ""})`} t="orange" />
+        {Object.entries(byProj).slice(0, 3).map(([k, v]) => <Stat key={k} n={inr(v)} label={k} t="blue" />)}
+      </div>
+      <Panel title="Site expenses" sub="Bills across projects — added by hand, or imported from the Drive bills folders via a paste."
+        right={<><Btn onClick={() => setImporting(true)}>Import from Drive check</Btn><Btn onClick={dl}>Download CSV</Btn><Btn kind="solid" onClick={() => setAdding(true)}>Add expense</Btn></>}>
+        <div className="filters">
+          <select value={proj} onChange={(e) => setProj(e.target.value)}>
+            <option value="">All projects</option>{projNames.map((x) => <option key={x}>{x}</option>)}
+          </select>
+          <select value={cat} onChange={(e) => setCat(e.target.value)}>
+            <option value="">All categories</option>{[...new Set([...EXP_CATS, ...(db.masters.expCategories || [])])].map((x) => <option key={x}>{x}</option>)}
+          </select>
+          <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
+          {month && <Btn onClick={() => setMonth("")}>All months</Btn>}
+        </div>
+        {Object.keys(byCat).length > 1 && (
+          <p className="fhint">By category: {Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${inr(v)}`).join(" · ")}</p>
+        )}
+        {rows.length === 0 ? <Empty>No expenses for this view — add one or run an import.</Empty> : (
+          <div className="scroll-x">
+            <table className="tbl">
+              <thead><tr><th>Date</th><th>Project</th><th>Vendor / description</th><th>Category</th><th className="amt">Amount</th><th>Bill</th><th></th></tr></thead>
+              <tbody>{rows.map((e) => (
+                <tr key={e.id}>
+                  <td>{fmtDate(e.date)}</td>
+                  <td>{e.project}</td>
+                  <td><b>{e.vendor || "—"}</b>{e.desc && <i className="sub">{e.desc.slice(0, 60)}</i>}</td>
+                  <td>{e.category || "—"}</td>
+                  <td className="amt">{inr(e.amount)}</td>
+                  <td>{e.bill ? <a href={e.bill} target="_blank" rel="noreferrer">View</a> : e.fileName ? <span className="muted" title={"In the Drive folder: " + e.fileName}>{String(e.fileName).slice(0, 18)}…</span> : "—"}</td>
+                  <td>{user.role === OWNER && <Btn onClick={() => del(e)}>Delete</Btn>}</td>
+                </tr>))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+      {adding && <ExpenseForm db={db} user={user} commit={commit} flash={flash} projNames={projNames} onClose={() => setAdding(false)} />}
+      {importing && <ExpenseImport db={db} user={user} commit={commit} flash={flash} onClose={() => setImporting(false)} />}
+    </>
+  );
+}
+
+function ExpenseForm({ db, user, commit, flash, projNames, onClose }) {
+  const [f, setF] = useState({ project: projNames[0] || "", date: today(), vendor: "", desc: "", category: "Material", amount: "", bill: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const onBill = async (e) => {
+    const fl = e.target.files[0];
+    e.target.value = "";
+    if (!fl) return;
+    if (fl.size > 15 * 1024 * 1024) return flash("This bill is over 15 MB — compress it and try again");
+    let data = null;
+    try {
+      if (/^image\//.test(fl.type)) data = await compressImage(fl, 1100, 0.75);
+      else data = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(fl); });
+    } catch { data = null; }
+    if (!data) return flash("The bill could not be read");
+    const u2 = await persistFile(data, fl.name);
+    setF((prev) => ({ ...prev, bill: u2 }));
+    flash("Bill attached");
+  };
+  const save = () => {
+    if (!f.project.trim() || !f.date || !Number(f.amount)) return flash("Project, date and amount are required");
+    commit((d) => {
+      ["expProjects", "vendors", "expCategories"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
+      learn(d, "expProjects", f.project); learn(d, "vendors", f.vendor); learn(d, "expCategories", f.category);
+      d.expenses.push({ ...f, amount: Number(f.amount), id: uid("ex"), source: "Manual", by: user.name, ts: Date.now() });
+    }, { by: user.name, action: "Expense added", detail: `${f.project} · ${f.vendor || f.desc} · ${inr(Number(f.amount))}` });
+    flash("Expense recorded"); onClose();
+  };
+  return (
+    <Modal title="Add expense" onClose={onClose} wide>
+      <div className="row2">
+        <SmartSelect label="Project" value={f.project} onChange={(v) => setF({ ...f, project: v })} options={projNames} />
+        <Field label="Bill date"><input type="date" value={f.date} onChange={set("date")} /></Field>
+      </div>
+      <div className="row2">
+        <SmartSelect label="Vendor" value={f.vendor} onChange={(v) => setF({ ...f, vendor: v })} options={db.masters.vendors || []} />
+        <SmartSelect label="Category" value={f.category} onChange={(v) => setF({ ...f, category: v })}
+          options={[...new Set([...EXP_CATS, ...(db.masters.expCategories || [])])]} />
+      </div>
+      <Field label="Description (optional)"><input value={f.desc} onChange={set("desc")} placeholder="e.g. 40 bags cement · challan 118" /></Field>
+      <Field label="Amount (₹)"><input type="number" value={f.amount} onChange={set("amount")} /></Field>
+      <Field label="Bill copy (photo or PDF, up to 15 MB)"><input type="file" accept="image/*,application/pdf" onChange={onBill} />{f.bill && <p className="fhint">Bill attached ✓</p>}</Field>
+      <Btn kind="solid" full onClick={save}>Save expense</Btn>
+    </Modal>
+  );
+}
+
+function ExpenseImport({ db, user, commit, flash, onClose }) {
+  const [txt, setTxt] = useState("");
+  const parse = () => {
+    let items = null;
+    try { items = JSON.parse(txt); } catch { items = null; }
+    if (!items) {
+      const rows = parseCSV(txt);
+      if (rows.length > 1) {
+        const hdr = rows[0].map((h) => String(h || "").toLowerCase().trim());
+        const ix = (n) => hdr.indexOf(n);
+        items = rows.slice(1).filter((r) => r.some((c) => String(c).trim())).map((r) => ({
+          date: r[ix("date")], project: r[ix("project")], vendor: ix("vendor") >= 0 ? r[ix("vendor")] : "",
+          desc: ix("description") >= 0 ? r[ix("description")] : (ix("desc") >= 0 ? r[ix("desc")] : ""),
+          category: ix("category") >= 0 ? r[ix("category")] : "",
+          amount: parseAmt(r[ix("amount")]), fileName: ix("file") >= 0 ? r[ix("file")] : "",
+        }));
+      }
+    }
+    return Array.isArray(items) ? items.filter((x) => x && x.date && x.project && Number(x.amount)) : null;
+  };
+  const doImport = () => {
+    const items = parse();
+    if (!items || !items.length) return flash("Nothing readable — paste the import block exactly as given, or a CSV with date, project, vendor, description, category, amount columns");
+    let added = 0, skipped = 0;
+    commit((d) => {
+      ["expProjects", "vendors", "expCategories"].forEach((k2) => { if (!d.masters[k2]) d.masters[k2] = []; });
+      items.forEach((x) => {
+        const dup = d.expenses.find((e) => e.project === x.project && e.date === x.date &&
+          Math.abs((Number(e.amount) || 0) - (Number(x.amount) || 0)) < 0.005 &&
+          (e.fileName || "") === (x.fileName || ""));
+        if (dup) { skipped++; return; }
+        learn(d, "expProjects", x.project); learn(d, "vendors", x.vendor || ""); learn(d, "expCategories", x.category || "");
+        d.expenses.push({ id: uid("ex"), date: x.date, project: x.project, vendor: x.vendor || "", desc: x.desc || "",
+          category: x.category || "", amount: Number(x.amount), fileName: x.fileName || "", bill: x.bill || "",
+          source: "Drive import", by: user.name, ts: Date.now() });
+        added++;
+      });
+    }, { by: user.name, action: "Expenses imported", detail: `${added} added · ${skipped} duplicates skipped` });
+    flash(`${added} expense(s) imported · ${skipped} duplicate(s) skipped`);
+    onClose();
+  };
+  return (
+    <Modal title="Import expenses" onClose={onClose} wide>
+      <p className="fhint">Ask in Claude: "check the bills folders" — the reply contains an import block for the new bills in the Central, Mahindra World City and T Nagar Drive folders. Paste it here whole. A plain CSV with date, project, vendor, description, category, amount columns works too. Duplicates (same project, date, amount, file) are skipped automatically, so importing twice is harmless.</p>
+      <textarea rows={10} value={txt} onChange={(e) => setTxt(e.target.value)} placeholder='[{"date":"2026-08-26","project":"Central","vendor":"Bhavan Water Supply","desc":"Tanker 12kl","category":"Water","amount":4500,"fileName":"2026.08.26 BHAVAN WATER SUPPLY.pdf"}]' style={{ width: "100%", fontFamily: "monospace", fontSize: 12 }} />
+      <Btn kind="solid" full onClick={doImport}>Import</Btn>
     </Modal>
   );
 }
